@@ -430,6 +430,82 @@ pub enum PartCommand {
         pid: u8,
         reply: tokio::sync::oneshot::Sender<HsmResult<()>>,
     },
+
+    /// Export the partition's cryptographic identity (PID, identity public
+    /// key, and identity private scalar) for emulator identity injection.
+    ExportIdentity {
+        pid: u8,
+        reply: tokio::sync::oneshot::Sender<HsmResult<PartIdentity>>,
+    },
+
+    /// Overwrite the partition's cryptographic identity with a previously
+    /// exported one, keeping it byte-stable across host processes on the
+    /// emulator.
+    InjectIdentity {
+        pid: u8,
+        ident: PartIdentity,
+        reply: tokio::sync::oneshot::Sender<HsmResult<()>>,
+    },
+}
+
+/// A partition's cryptographic identity, captured for emulator identity
+/// injection.
+///
+/// Carries the 16-byte PID, the 96-byte raw identity public key (`x ∥ y`,
+/// big-endian), and the bare identity private scalar. The private scalar is
+/// held in zeroizing storage so it is scrubbed on drop. This is emulator-only
+/// test scaffolding: it exposes the identity private key, which real hardware
+/// never permits.
+#[derive(Clone)]
+pub struct PartIdentity {
+    id: [u8; PART_ID_LEN],
+    id_pub: [u8; P384_PUB_KEY_LEN],
+    id_priv: Zeroizing<Vec<u8>>,
+}
+
+impl PartIdentity {
+    /// Build a [`PartIdentity`] from raw byte slices, validating the fixed PID
+    /// and public-key lengths and rejecting an empty private scalar.
+    pub fn from_parts(id: &[u8], id_pub: &[u8], id_priv: &[u8]) -> HsmResult<Self> {
+        if id.len() != PART_ID_LEN || id_pub.len() != P384_PUB_KEY_LEN || id_priv.is_empty() {
+            return Err(HsmError::InvalidArg);
+        }
+        let mut id_arr = [0u8; PART_ID_LEN];
+        id_arr.copy_from_slice(id);
+        let mut pub_arr = [0u8; P384_PUB_KEY_LEN];
+        pub_arr.copy_from_slice(id_pub);
+        Ok(Self {
+            id: id_arr,
+            id_pub: pub_arr,
+            id_priv: Zeroizing::new(id_priv.to_vec()),
+        })
+    }
+
+    /// The 16-byte partition identifier.
+    pub fn id(&self) -> &[u8] {
+        &self.id
+    }
+
+    /// The raw identity public key (`x ∥ y`, 96 bytes, big-endian).
+    pub fn id_pub(&self) -> &[u8] {
+        &self.id_pub
+    }
+
+    /// The bare identity private scalar.
+    pub fn id_priv(&self) -> &[u8] {
+        &self.id_priv
+    }
+}
+
+impl core::fmt::Debug for PartIdentity {
+    /// Redacted: never prints the identity key material, only field lengths.
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("PartIdentity")
+            .field("id_len", &self.id.len())
+            .field("id_pub_len", &self.id_pub.len())
+            .field("id_priv_len", &self.id_priv.len())
+            .finish()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -733,6 +809,67 @@ impl StdHsmPal {
         }
 
         self.table_mut().entries[idx].state = PartState::Allocated;
+        Ok(())
+    }
+
+    /// Export the partition's cryptographic identity for emulator identity
+    /// injection.
+    ///
+    /// Reads the partition's PID, raw identity public key, and bare identity
+    /// private scalar (from the vault) so a later process can restore the same
+    /// identity via [`part_inject_identity_internal`](Self::part_inject_identity_internal).
+    /// Emulator-only test scaffolding: it exposes the identity private key,
+    /// which real hardware never permits.
+    pub fn part_export_identity_internal(&self, pid: u8) -> HsmResult<PartIdentity> {
+        let idx = pid as usize;
+        if idx >= NUM_PARTITIONS {
+            return Err(HsmError::InvalidArg);
+        }
+        let table = self.table_mut();
+        let entry = &table.entries[idx];
+        let id_key_id = entry.id_key_id.ok_or(HsmError::InvalidArg)?;
+        let id_priv = entry.vault.key(id_key_id)?.to_vec();
+        Ok(PartIdentity {
+            id: entry.id,
+            id_pub: entry.id_pub_key,
+            id_priv: Zeroizing::new(id_priv),
+        })
+    }
+
+    /// Overwrite the partition's cryptographic identity with a previously
+    /// exported one.
+    ///
+    /// Replaces the PID and raw identity public key, swaps the identity vault
+    /// key for the supplied private scalar, and invalidates the cached leaf
+    /// certificate so it is rebuilt over the injected public key. Emulator-only
+    /// test scaffolding used to keep a partition's identity byte-stable across
+    /// separate host processes; real hardware retains its identity across
+    /// reboots and never permits this.
+    pub fn part_inject_identity_internal(&self, pid: u8, ident: &PartIdentity) -> HsmResult<()> {
+        let idx = pid as usize;
+        if idx >= NUM_PARTITIONS {
+            return Err(HsmError::InvalidArg);
+        }
+        let id_attrs = HsmVaultKeyAttrs::new()
+            .with_internal(true)
+            .with_local(true)
+            .with_sign(true);
+        let table = self.table_mut();
+        let entry = &mut table.entries[idx];
+        entry.id = ident.id;
+        entry.id_pub_key = ident.id_pub;
+        if let Some(old) = entry.id_key_id.take() {
+            let _ = entry.vault.delete(old);
+        }
+        let id_key_id = entry.vault.create(
+            &ident.id_priv[..],
+            HsmVaultKeyKind::Ecc384Private,
+            None,
+            id_attrs,
+        )?;
+        entry.id_key_id = Some(id_key_id);
+        entry.leaf_cert[..entry.leaf_cert_len].fill(0);
+        entry.leaf_cert_len = 0;
         Ok(())
     }
 

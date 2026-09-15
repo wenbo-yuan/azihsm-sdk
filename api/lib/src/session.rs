@@ -229,6 +229,32 @@ impl HsmSession {
         }
     }
 
+    /// Issues TBOR `KeyReport` on this CO session to attest an unpinned
+    /// SD sealing key supplied as its masked-blob envelope (from
+    /// `SdSealingKeyGen`), returning the tagged COSE_Sign1 attestation
+    /// report signed by the partition-identity key.
+    ///
+    /// Attesting a persisted masked blob (rather than a live
+    /// [`HsmSealingKey`](crate::HsmSealingKey) handle) lets a separate
+    /// process reload and attest a sealing key it did not itself generate.
+    /// Follows the size-query convention: a `None` `report` returns the
+    /// maximum report size without a device round-trip. Only valid on a V2
+    /// session; a V1 session returns [`HsmError::InvalidSession`].
+    pub fn sd_key_report(
+        &self,
+        masked_sealing_key: &[u8],
+        report_data: &[u8],
+        report: Option<&mut [u8]>,
+    ) -> HsmResult<usize> {
+        {
+            let inner = self.inner.read();
+            if !matches!(inner.kind, SessionKind::Ver2 { .. }) {
+                return Err(HsmError::InvalidSession);
+            }
+        }
+        ddi::masked_key_report(self, masked_sealing_key, report_data, report)
+    }
+
     /// Issues TBOR `SdCreateRemoteBackup` (opcode `0x0A`) on this CO
     /// session.
     ///

@@ -1,0 +1,38 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
+[package]
+edition = "2024"
+name = "azihsm_sealing_service"
+publish = false
+version = "0.1.0"
+
+[[bin]]
+name = "azihsm-sealing-service"
+path = "src/main.rs"
+
+[dependencies]
+azihsm_api.workspace = true
+azihsm_crypto.workspace = true
+azihsm_ddi_emu = { optional = true, workspace = true }
+azihsm_ddi_tbor_types.workspace = true
+chrono.workspace = true
+clap = { features = ["derive"], workspace = true }
+hex.workspace = true
+serde = { features = ["derive"], workspace = true }
+serde_json.workspace = true
+thiserror.workspace = true
+zerocopy = { features = ["derive"], workspace = true }
+
+[features]
+default = []
+# The `emu` flavor is built with `--features emu`; the `hw` flavor is the
+# default (no feature). Both flavors build the same `azihsm-sealing-service`
+# binary and differ only by this compile-time feature.
+emu = ["azihsm_api/emu", "dep:azihsm_ddi_emu"]
+
+[dev-dependencies]
+serde_json.workspace = true
+
+[lints]
+workspace = true

@@ -51,3 +51,8 @@ path = "junit.xml"
 # profile for running emu ddi tests
 [profile.ci-emu-ddi.junit]
 path = "junit.xml"
+
+# profile for running the sealing-service split-flow e2e tests against the emu
+# backend (separate command processes over a shared working dir).
+[profile.ci-emu-sealing.junit]
+path = "junit.xml"

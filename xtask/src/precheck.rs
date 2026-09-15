@@ -449,6 +449,23 @@ fn default_tests(exclude: &[String], profile: Option<String>) -> Vec<Nextest> {
         });
     }
 
+    // Run the sealing-service split-flow e2e suite against the emu backend.
+    // These cross-process tests are gated on the `emu` feature (the identity
+    // injection makes the emu partition identity byte-stable across the
+    // separate command processes), so they never run in the mock flavor above.
+    if !exclude.iter().any(|e| e == "azihsm_sealing_service") {
+        tests.push(Nextest {
+            features: Some("emu".to_string()),
+            package: Some("azihsm_sealing_service".to_string()),
+            no_default_features: false,
+            filterset: None,
+            profile: profile.clone().or(Some("ci-emu-sealing".to_string())),
+            exclude: exclude.to_owned(),
+            test: None,
+            filter: vec![],
+        });
+    }
+
     tests
 }
 

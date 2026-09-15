@@ -26,6 +26,8 @@
 use std::thread::JoinHandle;
 
 use azihsm_fw_hsm_core::Hsm;
+/// Re-exported for emulator identity injection (see [`StdHsm::part_export_identity`]).
+pub use azihsm_fw_hsm_pal_std::PartIdentity;
 use azihsm_fw_hsm_pal_std::*;
 use azihsm_fw_hsm_pal_traits::*;
 use embassy_sync::once_lock::OnceLock;
@@ -113,6 +115,12 @@ async fn ipc_task(rx: async_channel::Receiver<PartCommand>) {
             }
             PartCommand::Disable { pid, reply } => {
                 let _ = reply.send(pal.part_disable_internal(pid));
+            }
+            PartCommand::ExportIdentity { pid, reply } => {
+                let _ = reply.send(pal.part_export_identity_internal(pid));
+            }
+            PartCommand::InjectIdentity { pid, ident, reply } => {
+                let _ = reply.send(pal.part_inject_identity_internal(pid, &ident));
             }
         }
     }
@@ -370,6 +378,35 @@ impl StdHsm {
         let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
         let cmd = PartCommand::Disable {
             pid,
+            reply: reply_tx,
+        };
+        self.ipc_tx.send(cmd).await.expect("Embassy thread stopped");
+        reply_rx.await.expect("partition command reply dropped")
+    }
+
+    /// Export a partition's cryptographic identity (PID, identity public key,
+    /// and identity private scalar) for emulator identity injection.
+    ///
+    /// Emulator-only test scaffolding: it exposes the identity private key,
+    /// which real hardware never permits.
+    pub async fn part_export_identity(&self, pid: u8) -> HsmResult<PartIdentity> {
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        let cmd = PartCommand::ExportIdentity {
+            pid,
+            reply: reply_tx,
+        };
+        self.ipc_tx.send(cmd).await.expect("Embassy thread stopped");
+        reply_rx.await.expect("partition command reply dropped")
+    }
+
+    /// Overwrite a partition's cryptographic identity with a previously
+    /// exported one, keeping it byte-stable across host processes on the
+    /// emulator.
+    pub async fn part_inject_identity(&self, pid: u8, ident: PartIdentity) -> HsmResult<()> {
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        let cmd = PartCommand::InjectIdentity {
+            pid,
+            ident,
             reply: reply_tx,
         };
         self.ipc_tx.send(cmd).await.expect("Embassy thread stopped");

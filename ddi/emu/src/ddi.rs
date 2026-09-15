@@ -7,14 +7,20 @@ use std::sync::Arc;
 use std::sync::LazyLock;
 
 use azihsm_ddi_interface::Ddi;
+use azihsm_ddi_interface::DdiError;
 use azihsm_ddi_interface::DdiResult;
 use azihsm_ddi_interface::DevInfo;
+/// The partition cryptographic identity captured and restored by the emulator
+/// identity-injection side channel ([`emu_export_identity`] /
+/// [`emu_inject_identity`]).
+pub use azihsm_fw_hsm_std::PartIdentity;
 use azihsm_fw_hsm_std::StdHsm;
 use tokio::runtime::Handle;
 use tokio::runtime::Runtime;
 
 use crate::dev::DdiEmuDev;
 use crate::dev::EMU_DEVICE_PATH;
+use crate::dev::EMU_PID;
 
 /// Process-global emulator context.
 ///
@@ -100,6 +106,32 @@ impl Ddi for DdiEmu {
 /// Borrow the runtime handle from the global emulator context.
 fn runtime_handle() -> Handle {
     CTX.rt.handle().clone()
+}
+
+/// Export the emulator partition's cryptographic identity.
+///
+/// Emulator-only test scaffolding used by host-side tools to capture a
+/// partition's identity — PID, identity public key, and identity private
+/// scalar — so it can be restored in a later process via
+/// [`emu_inject_identity`], keeping the identity byte-stable across processes
+/// exactly as it is on hardware. Real hardware never exposes the identity
+/// private key.
+pub fn emu_export_identity() -> DdiResult<PartIdentity> {
+    runtime_handle()
+        .block_on(async { CTX.hsm.part_export_identity(EMU_PID).await })
+        .map_err(|_| DdiError::DeviceNotReady)
+}
+
+/// Overwrite the emulator partition's cryptographic identity with one
+/// previously captured by [`emu_export_identity`].
+///
+/// Emulator-only test scaffolding used to keep a partition's identity
+/// byte-stable across separate host processes; real hardware retains its
+/// identity across reboots and never permits this.
+pub fn emu_inject_identity(ident: PartIdentity) -> DdiResult<()> {
+    runtime_handle()
+        .block_on(async { CTX.hsm.part_inject_identity(EMU_PID, ident).await })
+        .map_err(|_| DdiError::DeviceNotReady)
 }
 
 #[cfg(test)]
