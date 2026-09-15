@@ -258,10 +258,12 @@ to `part_final_ex` are separate partition-finalization artifacts; they do not
 replace these three evidence chains.
 
 After its HSM report operation, `key_report` loads the three chains from the
-selected partition artifact directory, verifies that all four artifacts
-identify the same PID public key, verifies the report's policy binding, and
-writes the evidence bundle under the selected sealing key. Packaging the
-evidence requires no additional HSM operation.
+selected partition artifact directory and verifies that all four artifacts
+(the three chain leaves plus the persisted PID public key) identify the same
+PID public key. The report's policy binding is satisfied by construction: the
+report is freshly generated on the just-reconstructed partition, which was
+initialized with the recorded backing policy. Packaging the evidence requires
+no additional HSM operation.
 
 This per-partition authority generation is sufficient only for the initial
 self-backup flow. A multi-partition secure domain requires a shared test
@@ -630,11 +632,11 @@ Authority-set creation must be atomic. On Unix, authority directories use mode
 buffers must be zeroized after writing. The CLI must never print or include
 authority private keys in evidence bundles.
 
-The only cryptographic SDK surface still missing for the agreed CLI lifecycle
-is unrelated to authority persistence: the public API cannot yet generate a
-`key_report` from a persisted masked sealing-key blob in a later process. This
-is a narrow public-wrapper gap, not a missing capability. It requires the
-public wrapper change described below.
+The one cryptographic SDK surface that had to be added for the agreed CLI
+lifecycle is unrelated to authority persistence: the public API previously could
+not generate a `key_report` from a persisted masked sealing-key blob in a later
+process. This was a narrow public-wrapper gap, not a missing capability, and is
+now closed by the `HsmSession::sd_key_report` wrapper described below.
 
 Unmasking already exists and is not the gap. `KeyManager::unmask_key` and
 `KeyManager::unmask_key_pair` are public, and every key type restores its
@@ -663,24 +665,24 @@ holds `masked-key.bin` but has no public path to feed it to the report
 primitive.
 
 Before implementing the CLI, the SDK should expose the primitive directly as a
-session-level method that accepts the masked sealing-key blob:
+session-level method that accepts the masked sealing-key blob. This is
+implemented as `HsmSession::sd_key_report`, named for the `sd_*` session
+method family (`sd_create_remote_backup`, `sd_restore_local_backup`, …):
 
 ```rust
 impl HsmSession {
     /// Attests a persisted masked sealing-key envelope via TBOR KeyReport.
-    pub fn masked_sealing_key_report(
+    ///
+    /// Uses the size-query convention: a `None` report returns the maximum
+    /// report length without a device round-trip; a `Some(&mut buf)` fills the
+    /// buffer and returns the actual report length. Restricted to Ver2 (CO)
+    /// sessions.
+    pub fn sd_key_report(
         &self,
-        masked_key: &[u8],
+        masked_sealing_key: &[u8],
         report_data: &[u8],
         report: Option<&mut [u8]>,
     ) -> HsmResult<usize>;
-
-    /// Convenience allocating variant using the size-query convention.
-    pub fn masked_sealing_key_report_vec(
-        &self,
-        masked_key: &[u8],
-        report_data: &[u8],
-    ) -> HsmResult<Vec<u8>>;
 }
 ```
 
@@ -1168,9 +1170,11 @@ The identity injection mechanism keeps a partition's identity byte-stable across
 the separate CLI processes of the split flow, so that on the emulator the
 sequence `create_partition` → `create_sd_sealing_key` → `key_report` →
 `create_sd` (each its own process) behaves exactly as it does across separate
-hardware VMs. It is **emulator-only** and has **no effect on the hardware path**
-— every layer is behind the `emu-inject` build feature and is never compiled
-into a hardware build.
+hardware VMs. It is **emulator-only** and has **no effect on the hardware path**.
+The firmware and DDI layers live in crates that are only ever built for the
+emulator (`fw/plat/std/*`, `ddi/emu`), so they need no feature gate of their own;
+the CLI compiles its use of them behind its existing `emu` Cargo feature, so
+nothing here is ever compiled into a hardware build.
 
 ### Why it is needed
 
@@ -1220,8 +1224,8 @@ operations ride an IPC channel to its Embassy thread. Injection reuses that same
 path rather than the DDI wire, so it needs no changes to the api or DDI request
 contract:
 
-1. **PAL** (`fw/plat/std/pal/src/part.rs`) — two internal methods behind the
-   `emu-inject` feature: one exports `{PID, identity public key, identity
+1. **PAL** (`fw/plat/std/pal/src/part.rs`) — two internal methods in the
+   emulator-only PAL crate: one exports `{PID, identity public key, identity
    private scalar}` from the partition entry and its vault; the other overwrites
    `entry.id` and `entry.id_pub_key`, replaces the identity vault key from the
    supplied scalar, updates `entry.id_key_id`, and clears the leaf-cert cache.
@@ -1239,8 +1243,10 @@ contract:
 
 ### Guardrails
 
-- The entire mechanism is behind the `emu-inject` feature end-to-end and is
-  never compiled into a hardware build; it uses no `unsafe` code.
+- The firmware and DDI layers live in emulator-only crates (`fw/plat/std/*`,
+  `ddi/emu`) and the CLI compiles its use of them behind its existing `emu`
+  feature, so the mechanism is never compiled into a hardware build; it uses no
+  `unsafe` code.
 - The exported private scalar is held in zeroizing memory in process and
   persisted in plaintext only under the git-ignored emulator workspace — an
   accepted property of emulator test scaffolding, and never present on hardware.
@@ -1288,11 +1294,15 @@ from the `hw` flavor.
 **Common flow after backend preparation:**
 
 1. Load the named key's persisted masked sealing-key blob and public key.
-2. Call `session.masked_sealing_key_report(masked_key, report_data)`, passing
-   `report_data` when supplied. The HSM selects `PartLocalMK` from the blob's
-   `Local` scope and unmasks internally; the host performs no reconstruction or
-   unmasking.
-3. Embed the returned COSE_Sign1 report in the sealing key's evidence bundle.
+2. Call `session.sd_key_report(masked_key, report_data, report)`, passing
+   `report_data` (a caller-supplied 128-byte file or the all-zero default). The
+   two-call size-query convention returns the maximum length for a `None`
+   report and fills the buffer for a `Some` report. The HSM selects
+   `PartLocalMK` from the blob's `Local` scope and unmasks internally; the host
+   performs no reconstruction or unmasking.
+3. Load the partition's three DER certificate chains, verify each chain's leaf
+   certifies the partition PID public key, and package the chains together with
+   the returned COSE_Sign1 report into the sealing key's `.bin` evidence bundle.
 
 The plaintext sealing key and `PartLocalMK` never leave the HSM.
 
@@ -1443,3 +1453,69 @@ whether a single backing-partition policy is accepted by `part_init_ex` for
 independently initialized receivers is resolved above under **Shared
 backing-partition policy model**; it is validated by the required
 multi-partition integration test rather than left as a design unknown.
+
+## Testing
+
+The tool has two tiers of automated tests.
+
+**Unit tests** live beside the code they cover — for example the evidence
+bundle encode/decode round-trip and its rejection cases in
+`src/evidence.rs`. They run under either flavor with `cargo test -p
+azihsm_sealing_service`.
+
+**End-to-end integration tests** live in `tests/e2e.rs`. Each test spawns the
+built `azihsm-sealing-service` binary once per command — a distinct OS process
+per step, exchanging file-based state through a shared, disposable
+`--working-dir` — so they exercise the real cross-process split flow rather than
+in-process helpers. The whole file is gated on `#[cfg(feature = "emu")]`:
+only the emulator flavor runs without physical HSM hardware, and the
+emulator identity-injection layer keeps the partition identity byte-stable
+across processes so the split flow behaves like hardware. Built without
+`--features emu`, the file compiles to an empty test crate.
+
+Coverage:
+
+- `full_remote_backup_round_trip` — two partitions on a shared authority set,
+  sealing keys and key reports on both, `create_sd` on the backing partition
+  addressed to the receiver, then `restore_remote_backup` on the receiver.
+  Asserts the receiver's member area, the domain membership and consumed
+  hand-off, the receiver's recorded membership, and that a second restore is
+  rejected.
+- `self_backup_single_partition` — a self-backup domain has a single backing
+  member and an immediately-consumed hand-off, and a backing partition already
+  in a domain cannot back another.
+- `restore_without_domain_is_rejected` — restoring into a non-existent domain
+  fails without mutating the receiver's state.
+- `restore_local_backup_refreshes_recovery_pair` — a member refreshes its own
+  device-local recovery pair in place; the member manifest and its on-disk
+  artifacts stay consistent (a second refresh re-reads and re-verifies them),
+  and a non-member partition cannot self-restore.
+- `reseal_forwards_domain_to_third_partition` — the full A → B → C forwarding
+  chain: A creates the domain for B, B joins, B reseals the same BKS3 to a new
+  destination C, and C consumes the reseal hand-off via its own
+  `restore_remote_backup`. Asserts the outstanding hand-off is sourced by B, C
+  joins as a third member with lineage back to B, a partition with no inbound
+  backup cannot reseal, and resealing to an existing member is rejected.
+- `peer_backup_admits_new_member` — the peer-backup pair: member B hands the
+  domain's BKS3 to peer C (sealed to C's attested key) via `create_peer_backup`,
+  and C joins by consuming that peer hand-off via `restore_peer_backup`. Asserts
+  the outstanding `peer`-kind hand-off is sourced by B, C joins with peer lineage
+  back to B, a non-member cannot create a peer backup, and a second peer restore
+  is rejected.
+- `show_partitions_lists_domain_membership` — the read-only partition inventory:
+  A backs a domain that B joins while C stays unaffiliated. Asserts the table is
+  headed and sorted, that A shows its authority set, domain, and `backing` role,
+  that B shows the domain and `member` role, and that the non-member C ends in
+  the `-` domain and role columns.
+- `show_secure_domains_renders_lineage` — the read-only domain inventory: A backs
+  a domain, B joins, then B reseals to a not-yet-joined C. Asserts the domain
+  header names the backing partition, the backing member is the `(root)` while B
+  shows `<- part-a` provenance, B's join is a `consumed` hand-off, and the
+  outstanding reseal to C is rendered as `outstanding`.
+
+Run the full suite with:
+
+```bash
+cargo test -p azihsm_sealing_service --features emu
+```
+

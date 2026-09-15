@@ -60,7 +60,7 @@ pub const EMU_DEVICE_PATH: &str = "/dev/azihsm-emu";
 ///
 /// All IOs submitted via [`DdiEmuDev`] target this partition. The
 /// matching resource bit is set in [`EMU_PART_RES_MASK`].
-const EMU_PID: u8 = 10;
+pub(crate) const EMU_PID: u8 = 10;
 
 /// Resource bitmask passed to [`StdHsm::part_alloc`].
 const EMU_PART_RES_MASK: u128 = 1u128 << EMU_PID;

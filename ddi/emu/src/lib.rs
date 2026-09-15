@@ -14,6 +14,9 @@
 mod ddi;
 mod dev;
 
+pub use ddi::emu_export_identity;
+pub use ddi::emu_inject_identity;
 pub use ddi::DdiEmu;
+pub use ddi::PartIdentity;
 pub use dev::DdiEmuDev;
 pub use dev::EMU_DEVICE_PATH;
