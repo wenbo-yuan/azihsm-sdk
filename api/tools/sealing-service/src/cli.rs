@@ -4,9 +4,10 @@
 //! Command-line surface for `azihsm-sealing-service`.
 //!
 //! The argument definitions mirror the command-contracts table in
-//! `api/docs/design-sealing-service-cli.md`. The global `--working-dir <path>`
-//! option precedes the command name and is required by every command except
-//! `help` and `--version`.
+//! `api/docs/design-sealing-service-cli.md`. All host-side state lives in a
+//! single-file workspace container selected by the `AZIHSM_SEALING_STATE_PATH`
+//! environment variable (see [`crate::container`]); there is no per-command
+//! working-directory option.
 
 use std::path::PathBuf;
 
@@ -22,11 +23,6 @@ use clap::Subcommand;
     long_about = None,
 )]
 pub struct Cli {
-    /// Working directory holding all partition, authority-set, and
-    /// secure-domain artifacts. Required for every command except `help`.
-    #[arg(long, value_name = "PATH", global = true)]
-    pub working_dir: Option<PathBuf>,
-
     /// The command to run.
     #[command(subcommand)]
     pub command: Command,
@@ -79,18 +75,14 @@ pub struct CreatePartitionArgs {
     pub partition: String,
 
     /// Create a new authority set (and its backing policy) with this name.
-    /// Mutually exclusive with `--authority-set`/`--policy`.
-    #[arg(long, value_name = "NAME", conflicts_with_all = ["authority_set", "policy"])]
+    /// Mutually exclusive with `--authority-set`.
+    #[arg(long, value_name = "NAME", conflicts_with_all = ["authority_set"])]
     pub new_authority_set: Option<String>,
 
-    /// Reuse an existing authority set with this name. Requires `--policy`.
-    #[arg(long, value_name = "NAME", requires = "policy")]
+    /// Reuse an existing authority set with this name. Its single stored shared
+    /// policy is loaded from the workspace container.
+    #[arg(long, value_name = "NAME")]
     pub authority_set: Option<String>,
-
-    /// Path to the exact shared policy to use verbatim. Requires
-    /// `--authority-set`.
-    #[arg(long, value_name = "FILE", requires = "authority_set")]
-    pub policy: Option<PathBuf>,
 }
 
 /// `create_sd_sealing_key` arguments.

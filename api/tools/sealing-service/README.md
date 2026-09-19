@@ -2,10 +2,19 @@
 
 `azihsm-sealing-service` is a command-line tool that drives the sealing-service
 secure-domain provisioning, backup, and recovery flow. Each command is a
-**separate OS process** that exchanges state through files under a shared
-`--working-dir`, deliberately mirroring the multi-VM reality on hardware: on a
-real deployment each partition lives on its own machine, so the tool never keeps
-a partition "live" in memory across commands.
+**separate OS process** that exchanges state through a single **binary state
+file** — a self-contained container that holds the entire workspace — selected
+by the `AZIHSM_SEALING_STATE_PATH` environment variable. This deliberately
+mirrors the multi-VM reality on hardware: on a real deployment each partition
+lives on its own machine, so the tool never keeps a partition "live" in memory
+across commands.
+
+Each command transparently unpacks the state file into a private scratch
+directory, runs, then repacks it and writes it back atomically (owner-only,
+`0600`). If a command fails, the state file is left untouched, so every command
+is all-or-nothing. When the env var is unset (or empty), the tool defaults to
+`./azihsm-sealing-state.bin` in the current directory; a missing file is treated
+as an empty workspace and created on first write.
 
 The full design contract lives in
 [`api/docs/design-sealing-service-cli.md`](../../docs/design-sealing-service-cli.md);
@@ -25,12 +34,29 @@ Both flavors expose the identical CLI surface. The flavor is fixed at build time
 and reported by `azihsm-sealing-service --version`; there is no runtime backend
 switch.
 
+## State file
+
+All host-side state lives in one binary container file. Point every command at
+the same file with the `AZIHSM_SEALING_STATE_PATH` environment variable:
+
+```bash
+export AZIHSM_SEALING_STATE_PATH=/tmp/sealing-demo.bin
+```
+
+- **Unset or empty** → defaults to `./azihsm-sealing-state.bin`.
+- **Missing file** → treated as an empty workspace; created on the first command
+  that writes state.
+- **Permissions** → written owner-only (`0600`), since it holds sealing secrets.
+
+There is no `--working-dir` option: the container replaces the on-disk directory
+tree. The logical layout *inside* the container is unchanged (see
+[Workspace layout](#workspace-layout)).
+
 ## Commands
 
-Every command takes the global `--working-dir <path>` before the command name.
 Evidence arguments (`--receiver-evidence`, `--sender-evidence`,
 `--peer-evidence`) are `<partition>/<key>/<report>` **workspace references**, not
-filesystem paths.
+filesystem paths — they address entries inside the state container.
 
 | Command | Purpose | Key inputs (read) | Outputs (written) |
 |---------|---------|-------------------|-------------------|
@@ -61,49 +87,56 @@ azihsm-sealing-service <command> --help  # usage for one command
 ## Quickstart
 
 A minimal single-partition (self-backup) flow on the emulator. Every line is a
-separate process; `WD` is the shared working directory:
+separate process; all share one state file via the environment variable:
 
 ```bash
 BIN=target/debug/azihsm-sealing-service
-WD=/tmp/sealing-demo
+export AZIHSM_SEALING_STATE_PATH=/tmp/sealing-demo.bin
 
 # 1. Provision a partition with a fresh authority set.
-$BIN --working-dir "$WD" create_partition --partition p1 --new-authority-set auth-a
+$BIN create_partition --partition p1 --new-authority-set auth-a
 
 # 2. Mint a sealing key and attest it (produces an evidence bundle).
-$BIN --working-dir "$WD" create_sd_sealing_key --partition p1 --sealing-key k1
-$BIN --working-dir "$WD" key_report --partition p1 --sealing-key k1 --report r1
+$BIN create_sd_sealing_key --partition p1 --sealing-key k1
+$BIN key_report --partition p1 --sealing-key k1 --report r1
 
 # 3. Create a secure domain backed by p1, addressed to itself (self-backup).
-$BIN --working-dir "$WD" create_sd \
+$BIN create_sd \
     --partition p1 --secure-domain sd1 --sealing-key k1 --receiver-evidence p1/k1/r1
 
 # 4. Inspect the workspace.
-$BIN --working-dir "$WD" show_partitions
-$BIN --working-dir "$WD" show_secure_domains
+$BIN show_partitions
+$BIN show_secure_domains
 ```
 
 To admit a *second* partition, provision it against the **same** authority set
-and shared policy, then run `create_sd` on the backing partition addressed to
-the new partition's evidence, and `restore_remote_backup` on the new partition:
+(its single stored policy is loaded from the state container automatically), then
+run `create_sd` on the backing partition addressed to the new partition's
+evidence, and `restore_remote_backup` on the new partition:
 
 ```bash
-POLICY="$WD/authority-sets/auth-a/policy.bin"
-$BIN --working-dir "$WD" create_partition --partition p2 --authority-set auth-a --policy "$POLICY"
-$BIN --working-dir "$WD" create_sd_sealing_key --partition p2 --sealing-key k2
-$BIN --working-dir "$WD" key_report --partition p2 --sealing-key k2 --report r2
+$BIN create_partition --partition p2 --authority-set auth-a
+$BIN create_sd_sealing_key --partition p2 --sealing-key k2
+$BIN key_report --partition p2 --sealing-key k2 --report r2
 
 # Backing p1 hands off to p2; p2 joins.
-$BIN --working-dir "$WD" create_sd \
+$BIN create_sd \
     --partition p1 --secure-domain sd1 --sealing-key k1 --receiver-evidence p2/k2/r2
-$BIN --working-dir "$WD" restore_remote_backup \
+$BIN restore_remote_backup \
     --partition p2 --secure-domain sd1 --sealing-key k2 --sender-evidence p1/k1/r1
 ```
 
+Each authority set owns exactly one shared policy (derived from the backing
+partition when the set is created), so reusing an authority set is all that is
+needed — there is no separate policy argument.
+
 ## Workspace layout
 
+The state container is a single binary file (`AZIHSM_SEALING_STATE_PATH`). Its
+logical contents — what each command reads and writes — form this tree:
+
 ```text
-<working-dir>/
+<state container>
 ├── authority-sets/<name>/   authority-set.json, policy.bin, roots/, secrets/
 ├── partitions/<name>/       partition.json, attestation/, secrets/, recovery/, sealing-keys/
 └── secure-domains/<name>/   secure-domain.json, policy.bin,
@@ -119,14 +152,17 @@ hand-offs — an entry is deleted (consumed) once the destination joins.
 
 Tests are split into two layers, both in the `azihsm_sealing_service` package:
 
-- **Unit tests** (`src/evidence.rs`, `#[cfg(test)]`) — 4 tests covering the
-  evidence-bundle codec. They run in every flavor.
+- **Unit tests** (`#[cfg(test)]`) — the evidence-bundle codec (`src/evidence.rs`)
+  and the state-container format (`src/container.rs`, covering pack/unpack
+  round-trips, truncation, and path-escape rejection). They run in every flavor.
 - **End-to-end tests** (`tests/e2e.rs`, gated `#![cfg(feature = "emu")]`) — 8
-  tests that spawn the *built binary* once per command over a disposable
-  `--working-dir`, exercising the real cross-process split flow. They run only
-  on the `emu` flavor, because the emulator's identity injection makes the
-  partition identity byte-stable across the separate command processes (mock and
-  hardware flavors cannot reproduce the split flow deterministically).
+  tests that spawn the *built binary* once per command, each pointed at a
+  disposable state file via `AZIHSM_SEALING_STATE_PATH`, exercising the real
+  cross-process split flow. They decode the resulting `.bin` container in-process
+  to assert on the persisted manifests and artifacts. They run only on the `emu`
+  flavor, because the emulator's identity injection makes the partition identity
+  byte-stable across the separate command processes (mock and hardware flavors
+  cannot reproduce the split flow deterministically).
 
 Run everything on the emulator flavor:
 
@@ -137,8 +173,9 @@ cargo test -p azihsm_sealing_service --features emu
 ### Precheck integration
 
 `cargo xtask precheck` (the minimal default) builds the `mock` flavor and so runs
-only the 4 unit tests; the emu-gated e2e suite is compiled out. The full run
-executes the e2e suite via the dedicated `ci-emu-sealing` nextest profile:
+only the unit tests (evidence + container); the emu-gated e2e suite is compiled
+out. The full run executes the e2e suite via the dedicated `ci-emu-sealing`
+nextest profile:
 
 ```bash
 cargo xtask precheck --full     # includes the emu e2e suite
@@ -149,8 +186,9 @@ cargo xtask precheck --nextest -F emu -p azihsm_sealing_service
 ### End-to-end test flows
 
 Each e2e test builds only the partitions it needs, drives the split flow, and
-then reads the persisted manifests and artifacts back to assert the outcome.
-"Reads back" below means assertions on stdout and/or on-disk JSON manifests.
+then decodes the persisted state container to read the manifests and artifacts
+back and assert the outcome. "Reads back" below means assertions on stdout
+and/or on the JSON manifests inside the container.
 
 #### `full_remote_backup_round_trip` — 2 partitions
 - **Partitions:** `part-a` (backing) and `part-b` (receiver) on a shared
@@ -191,9 +229,9 @@ then reads the persisted manifests and artifacts back to assert the outcome.
   refreshes `members/solo/{pok-local-backup,sd-mk-backup}.bin` in place; runs a
   second refresh; provisions `loner`.
 - **Reads back:** the refresh summary prints; the member manifest's recorded
-  artifact lengths match the files on disk (no drift); a second refresh succeeds
-  by re-reading and re-verifying the freshly written pair; `loner` cannot
-  self-restore (rejected — not a member of any domain).
+  artifact lengths match the files in the container (no drift); a second refresh
+  succeeds by re-reading and re-verifying the freshly written pair; `loner`
+  cannot self-restore (rejected — not a member of any domain).
 
 #### `reseal_forwards_domain_to_third_partition` — 3 partitions
 - **Partitions:** `part-a` (backing) → `part-b` (member) → `part-c` (new

@@ -20,6 +20,7 @@
 mod authority;
 mod cli;
 mod commands;
+mod container;
 mod crypto;
 mod error;
 mod evidence;

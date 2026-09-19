@@ -13,8 +13,8 @@
 //!
 //! * `--new-authority-set <name>` generates a fresh authority set and derives a
 //!   backing-partition policy from this partition's identity;
-//! * `--authority-set <name> --policy <file>` reuses an existing authority set
-//!   and its exact shared policy (validated against the set's SATA/POTA keys).
+//! * `--authority-set <name>` reuses an existing authority set and its single
+//!   stored shared policy (validated against the set's SATA/POTA keys).
 
 use azihsm_ddi_tbor_types::PART_POLICY_LEN;
 
@@ -89,8 +89,8 @@ fn resolve_mode(
     ws: &Workspace,
     args: &CreatePartitionArgs,
 ) -> Result<(AuthoritySet, Option<[u8; PART_POLICY_LEN]>, bool, String)> {
-    match (&args.new_authority_set, &args.authority_set, &args.policy) {
-        (Some(name), None, None) => {
+    match (&args.new_authority_set, &args.authority_set) {
+        (Some(name), None) => {
             let dir = ws.authority_set_dir(name);
             if dir.exists() {
                 return Err(Error::AlreadyExists {
@@ -101,14 +101,17 @@ fn resolve_mode(
             let authset = AuthoritySet::generate(name)?;
             Ok((authset, None, true, name.clone()))
         }
-        (None, Some(name), Some(policy_path)) => {
+        (None, Some(name)) => {
             let authset = AuthoritySet::load(ws, name)?;
 
-            let bytes = util::read_file(policy_path)?;
+            // An authority set stores exactly one shared policy; reuse loads it
+            // verbatim from the workspace container.
+            let policy_path = ws.authority_set_policy(name);
+            let bytes = util::read_file(&policy_path)?;
             if bytes.len() != PART_POLICY_LEN {
                 return Err(Error::InvalidArgs(format!(
-                    "policy `{}` must be {PART_POLICY_LEN} bytes, got {}",
-                    policy_path.display(),
+                    "stored policy for authority set `{name}` must be \
+                     {PART_POLICY_LEN} bytes, got {}",
                     bytes.len()
                 )));
             }
@@ -120,14 +123,12 @@ fn resolve_mode(
             Ok((authset, Some(policy_bytes), false, name.clone()))
         }
         _ => Err(Error::InvalidArgs(
-            "provide either --new-authority-set <name> or \
-             --authority-set <name> --policy <file>"
-                .to_owned(),
+            "provide either --new-authority-set <name> or --authority-set <name>".to_owned(),
         )),
     }
 }
 
-/// Confirm the supplied policy's SATA and POTA public keys match the authority
+/// Confirm the stored policy's SATA and POTA public keys match the authority
 /// set that must issue this partition's chains and sign its PTA chain.
 fn validate_policy_anchors(policy_bytes: &[u8], authset: &AuthoritySet) -> Result<()> {
     let sata = policy::sata_raw_from_policy(policy_bytes)?;

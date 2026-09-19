@@ -70,16 +70,24 @@ the CLI does not expose a runtime `--backend` selector.
 The executable syntax is the same for both flavors:
 
 ```text
-azihsm-sealing-service --working-dir <path> <command> [command options]
+azihsm-sealing-service <command> [command options]
 ```
+
+All host-side state lives in a single binary **state container** file whose path
+comes from the `AZIHSM_SEALING_STATE_PATH` environment variable (default
+`./azihsm-sealing-state.bin` when the variable is unset or empty). Each command
+transparently unpacks the container into a private scratch directory, runs, then
+repacks it and writes it back atomically with owner-only (`0600`) permissions; a
+failed command leaves the container untouched, making every command
+all-or-nothing. A missing container is treated as an empty workspace.
 
 Emulator partition replay is compiled only under `#[cfg(feature = "emu")]`.
 The hardware flavor uses `#[cfg(not(feature = "emu"))]` paths and does not
 contain a runtime branch that can invoke emulator replay.
 
 Both compiled flavors expose the same CLI arguments. There are no
-flavor-specific command-line options. The build selects the DDI backend;
-`--working-dir` stores logical partition state for `emu` and host-visible
+flavor-specific command-line options. The build selects the DDI backend; the
+state container stores logical partition state for `emu` and host-visible
 artifacts for `hw`.
 
 The CLI uses SDK-style snake-case command names so each user-facing command
@@ -120,20 +128,22 @@ not reload hardware device state.
 
 ## Command contracts
 
-All commands take the global `--working-dir <path>` option before the command
-name. Evidence arguments (`--receiver-evidence`, `--sender-evidence`,
+All host-side state is selected by the `AZIHSM_SEALING_STATE_PATH` environment
+variable (see the command model above); there is no `--working-dir` option.
+Evidence arguments (`--receiver-evidence`, `--sender-evidence`,
 `--peer-evidence`) are `<partition>/<key>/<report>` workspace references, not
 filesystem paths. Backup inputs are resolved from fixed, role-named artifacts
 under the named secure domain — a partition's own device-local recovery
 envelope, or the hand-off backup addressed to it — never from a numbered
 generation. There is no `--generation` selector, because a domain is one BKS3
-with one set of role-named artifacts, not a version history. The policy is
-never a command-line argument; it is loaded from the partition manifest.
-Command outputs are the artifacts described in the workspace layout below.
+with one set of role-named artifacts, not a version history. The secure-domain
+policy is never a command-line argument for the backup commands; it is loaded
+from the partition manifest. Command outputs are the artifacts described in the
+workspace layout below.
 
 | CLI command | SDK operation | Command-line arguments | Output artifacts |
 |---|---|---|---|
-| `create_partition` | `open_session_ex` (bootstrap, default PSK) + `change_psk` + close + `open_session_ex` (reopen, rotated PSK) + `part_init_ex` + `part_final_ex` | `--partition <name>` and either `--new-authority-set <name>` or `--authority-set <name> --policy <file>` | Initialized partition workspace: `secrets/co-psk.bin`, PID public key and three PID chains under `attestation/`, `recovery/{mach-seed.bin,part-final-local-mk-backup.bin}` (`emu`); new-mode also writes the authority set and `policy.bin` |
+| `create_partition` | `open_session_ex` (bootstrap, default PSK) + `change_psk` + close + `open_session_ex` (reopen, rotated PSK) + `part_init_ex` + `part_final_ex` | `--partition <name>` and either `--new-authority-set <name>` or `--authority-set <name>` (reuse loads the authority set's single stored policy from the container) | Initialized partition workspace: `secrets/co-psk.bin`, PID public key and three PID chains under `attestation/`, `recovery/{mach-seed.bin,part-final-local-mk-backup.bin}` (`emu`); new-mode also writes the authority set and `policy.bin` |
 | `create_sd_sealing_key` | `SdSealingKeyGen` | `--partition <name> --sealing-key <new-key-name>` | `sealing-keys/<key>/{masked-key.bin,public-key.der}` |
 | `key_report` | `KeyReport` | `--partition <name> --sealing-key <key-name> --report <report-name> [--report-data <file>]` | `sealing-keys/<key>/evidence/<report>.bin` (report embedded, no standalone `.cose`) |
 | `create_sd` | `sd_create_remote_backup` | `--partition <backing> --secure-domain <new-domain> --sealing-key <backing-key> --receiver-evidence <ref>` | New `secure-domains/<domain>/` with `members/<backing>/{pok-local-backup,sd-mk-backup}.bin` and `remote-backups/<receiver>.bin` |
@@ -143,8 +153,8 @@ Command outputs are the artifacts described in the workspace layout below.
 | `create_peer_backup` | `sd_create_peer_backup` | `--partition <name> --secure-domain <domain> --sealing-key <sender-key> --peer-evidence <ref>` | New hand-off `peer-backups/<dest>.bin` |
 | `restore_peer_backup` | `sd_restore_peer_backup` | `--partition <receiver> --secure-domain <domain> --sealing-key <receiver-key> --peer-evidence <ref>` | New `members/<receiver>/{pok-local-backup,sd-mk-backup}.bin`; consumed `peer-backups/<receiver>.bin` |
 | `help` | none | `[<command>]` | Prints command usage to stdout; no files written |
-| `show_partitions` | none | none (uses the global `--working-dir`) | Prints a per-partition table (authority set, sealing keys, secure domain, SD role) to stdout; no files written |
-| `show_secure_domains` | none | none (uses the global `--working-dir`) | Prints per-secure-domain membership and hand-off lineage (backing partition, members, outbound hand-offs) to stdout; no files written |
+| `show_partitions` | none | none (reads the state container) | Prints a per-partition table (authority set, sealing keys, secure domain, SD role) to stdout; no files written |
+| `show_secure_domains` | none | none (reads the state container) | Prints per-secure-domain membership and hand-off lineage (backing partition, members, outbound hand-offs) to stdout; no files written |
 
 `create_sd` is the user-facing name for the SDK's
 `sd_create_remote_backup` operation. The SDK operation both creates the
@@ -161,8 +171,8 @@ azihsm-sealing-service create_sd \
 ```
 
 Evidence arguments are workspace references, not unrestricted filesystem
-paths. For example, `partition-b/key-b/report-1` resolves beneath the selected
-working directory to:
+paths. For example, `partition-b/key-b/report-1` resolves inside the state
+container to:
 
 ```text
 partitions/partition-b/sealing-keys/key-b/evidence/report-1.bin
@@ -286,11 +296,10 @@ create_partition \
   --partition <name> \
   --new-authority-set <authority-set-name>
 
-# Additional partition: reuse the authority set and exact policy.
+# Additional partition: reuse the authority set and its single stored policy.
 create_partition \
   --partition <name> \
-  --authority-set <authority-set-name> \
-  --policy <path-to-policy.bin>
+  --authority-set <authority-set-name>
 ```
 
 The reusable authority set contains the test manufacturer, owner, SATA, and
@@ -300,9 +309,16 @@ public key and `part_final_ex` needs the corresponding authority to issue the
 new partition's PTA chain. If SAPOTA is enabled in the policy, its authority
 must be included as well.
 
+Each authority set owns exactly one shared policy — the backing-partition policy
+derived and stored (`policy.bin`) when the set is created with
+`--new-authority-set`. Reuse therefore takes no policy argument: the CLI loads
+that single stored policy from the state container. (This 1:1 authority-set ↔
+policy binding matches the intended flow, where an authority set exists to
+provision one shared secure domain, which requires one exact shared policy.)
+
 Before initializing an additional partition, the CLI validates that the SATA,
 POTA, and optional SAPOTA public keys in the authority set exactly match the
-keys embedded in the supplied policy. The policy is then used verbatim; the
+keys embedded in the stored policy. The policy is then used verbatim; the
 CLI must not regenerate it or replace its backing-partition identity fields.
 
 ### Cross-partition remote restore
@@ -720,8 +736,13 @@ partition state persists on the device.
 
 ## Partition artifact layout
 
+All artifacts below live *inside* the single binary state container
+(`AZIHSM_SEALING_STATE_PATH`); the paths shown are the container's logical,
+POSIX-relative entry names, materialized into a scratch directory only for the
+duration of one command.
+
 ```text
-<working-dir>/
+<state container>
 ├── authority-sets/
 │   └── <authority-set-name>/
 │       ├── authority-set.json
@@ -856,8 +877,8 @@ All four manifests are UTF-8 JSON documents with a single top-level object.
 They share these conventions:
 
 - `schema_version` is the integer literal `1`. `kind` names the manifest type.
-- All path values are POSIX (`/`-separated) and resolved relative to
-  `<working-dir>`; manifests never store absolute host paths.
+- All path values are POSIX (`/`-separated) and resolved relative to the state
+  container root; manifests never store absolute host paths.
 - `*_sha384` values are 96-character lowercase-hex SHA-384 digests of the file
   or DER bytes they name.
 - `pid` and `*_public_key_sha384` values are lowercase hex.
@@ -1117,7 +1138,7 @@ needs the emulator partition's local masking key performs reconstruction as an
 internal prerequisite:
 
 1. Load and validate
-   `<working-dir>/partitions/<partition>/partition.json`.
+   `partitions/<partition>/partition.json` from the state container.
 2. Reset the emulator partition to factory state.
 3. Run the complete V2 TBOR session setup: `open_session_ex`
    (`OpenSessionInit` / `OpenSessionFinish`) under the partition default CO
@@ -1310,9 +1331,8 @@ The plaintext sealing key and `PartLocalMK` never leave the HSM.
 
 The `hw` flavor writes host-visible results, including the generated test
 certificate chains, masked sealing keys, public keys, evidence bundles, and
-backup blobs, beneath the selected partition artifact directory in
-`--working-dir`.
-Commands may use the partition name to resolve those artifacts.
+backup blobs, beneath the selected partition artifact directory inside the state
+container. Commands may use the partition name to resolve those artifacts.
 
 The hardware partition directory remains an artifact destination, not a
 replayable partition workspace. Its folder or file names do not select,
@@ -1339,8 +1359,8 @@ flavors. Neither takes arguments; each always lists every entry in the
 workspace:
 
 ```text
-azihsm-sealing-service --working-dir <path> show_partitions
-azihsm-sealing-service --working-dir <path> show_secure_domains
+azihsm-sealing-service show_partitions
+azihsm-sealing-service show_secure_domains
 ```
 
 `show_partitions` scans the versioned manifests beneath `partitions/` and
@@ -1459,15 +1479,18 @@ multi-partition integration test rather than left as a design unknown.
 The tool has two tiers of automated tests.
 
 **Unit tests** live beside the code they cover — for example the evidence
-bundle encode/decode round-trip and its rejection cases in
-`src/evidence.rs`. They run under either flavor with `cargo test -p
-azihsm_sealing_service`.
+bundle encode/decode round-trip and its rejection cases in `src/evidence.rs`,
+and the state-container pack/unpack round-trip, truncation, and path-escape
+rejection in `src/container.rs`. They run under either flavor with `cargo test
+-p azihsm_sealing_service`.
 
 **End-to-end integration tests** live in `tests/e2e.rs`. Each test spawns the
 built `azihsm-sealing-service` binary once per command — a distinct OS process
-per step, exchanging file-based state through a shared, disposable
-`--working-dir` — so they exercise the real cross-process split flow rather than
-in-process helpers. The whole file is gated on `#[cfg(feature = "emu")]`:
+per step, each pointed at the same disposable state file via the
+`AZIHSM_SEALING_STATE_PATH` environment variable — so they exercise the real
+cross-process split flow rather than in-process helpers. Assertions decode the
+resulting binary container in-process to inspect the persisted manifests and
+artifacts. The whole file is gated on `#[cfg(feature = "emu")]`:
 only the emulator flavor runs without physical HSM hardware, and the
 emulator identity-injection layer keeps the partition identity byte-stable
 across processes so the split flow behaves like hardware. Built without

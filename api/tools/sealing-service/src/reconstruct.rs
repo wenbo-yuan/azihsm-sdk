@@ -119,7 +119,7 @@ fn load_mach_seed(ws: &Workspace, rel_path: &str) -> Result<[u8; MACH_SEED_LEN]>
     Ok(seed)
 }
 
-/// Read a file named by a working-dir-relative POSIX path from a manifest.
+/// Read a file named by a workspace-relative POSIX path from a manifest.
 pub fn read_workspace_file(ws: &Workspace, rel_path: &str) -> Result<Vec<u8>> {
     util::read_file(&ws.root().join(rel_path))
 }
