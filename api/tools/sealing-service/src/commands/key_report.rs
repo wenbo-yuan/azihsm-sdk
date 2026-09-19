@@ -8,7 +8,7 @@
 //! blob, packages that report together with the partition's three DER
 //! certificate chains into a persisted evidence bundle, and records the bundle
 //! in the partition manifest. The bundle is the receiver-side evidence a peer's
-//! `create_sd` consumes to admit this partition into a security domain.
+//! `create_remote_backup` consumes to admit this partition into a security domain.
 
 use azihsm_ddi_tbor_types::KEY_REPORT_DATA_LEN;
 

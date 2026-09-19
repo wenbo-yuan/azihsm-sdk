@@ -3,16 +3,19 @@
 
 //! `reseal_remote_backup` — re-wrap a domain's BKS3 to a new destination.
 //!
-//! Runs on a partition that already holds the secure domain (for example the
-//! original receiver B). Reconstructs that partition (emulator replay or direct
-//! `hw` open), HPKE-opens the inbound hand-off addressed to it
-//! (`remote-backups/<reseal-partition>.bin`) with its own masked sealing key —
-//! authenticated by the original sender's evidence — and HPKE-Auth-seals the
-//! recovered **same BKS3** to a new destination's attested public key. The
-//! result is written as a new outstanding hand-off `remote-backups/<dest>.bin`;
-//! no new domain, member area, or recovery point is minted. The destination
-//! becomes a member only after it runs `restore_remote_backup` against this
-//! reseal output.
+//! Runs on any partition addressed by an outstanding inbound remote hand-off
+//! (`remote-backups/<reseal-partition>.bin`) — the partition need not have
+//! joined the domain first. Reconstructs the partition (emulator replay or
+//! direct `hw` open), HPKE-opens that inbound hand-off with its own masked
+//! sealing key — authenticated by the original sender's evidence — and
+//! HPKE-Auth-seals the recovered **same BKS3** to a new destination's attested
+//! public key. The result is written as a new outstanding hand-off
+//! `remote-backups/<dest>.bin`; no new domain, member area, or recovery point
+//! is minted, and the reseal partition is not added as a member. This matches
+//! the firmware, which needs only the inbound `pok_remote_backup` and never the
+//! domain's `sd_mk_backup`, so a pure relay partition can forward the domain
+//! without ever installing it locally. The destination becomes a member only
+//! after it runs `restore_remote_backup` against this reseal output.
 
 use crate::cli::ResealRemoteBackupArgs;
 use crate::crypto::certs;
@@ -60,17 +63,24 @@ pub fn run(ws: &Workspace, args: &ResealRemoteBackupArgs) -> Result<()> {
     }
     let reseal_manifest: PartitionManifest = manifest::read(&reseal_manifest_path)?;
 
-    // The reseal partition must be a member of this domain.
-    let records_domain = reseal_manifest.secure_domain.as_deref() == Some(domain);
-    let is_member = domain_manifest
-        .members
+    // Match the firmware: any partition addressed by an outstanding inbound
+    // remote hand-off can reseal it forward — it need not have joined the
+    // domain. `sd_reseal_remote_backup` recovers BKS3 from that inbound
+    // `pok_remote_backup` alone (unwrapped with the partition's own sealing key
+    // and authenticated by the sender's evidence) and never consumes the
+    // domain's `sd_mk_backup`, so no local member material is required. This
+    // admits a pure relay partition that transports the domain to a third
+    // partition without ever installing it locally.
+    let inbound_key_sha384 = domain_manifest
+        .handoffs
         .iter()
-        .any(|m| m.partition == reseal);
-    if !records_domain || !is_member {
-        return Err(Error::InvalidArgs(format!(
-            "partition `{reseal}` is not a member of secure domain `{domain}`"
-        )));
-    }
+        .find(|h| h.kind == HandoffKind::Remote && h.destination == reseal)
+        .map(|h| h.sealing_key_sha384.clone())
+        .ok_or_else(|| {
+            Error::InvalidArgs(format!(
+                "partition `{reseal}` has no inbound remote hand-off in secure domain `{domain}`"
+            ))
+        })?;
 
     // The reseal partition must own the named sealing key.
     let reseal_key = reseal_manifest
@@ -81,6 +91,14 @@ pub fn run(ws: &Workspace, args: &ResealRemoteBackupArgs) -> Result<()> {
             what: "sealing key",
             path: ws.partition_sealing_key_dir(reseal, sealing_key_name),
         })?;
+
+    // The named sealing key must be the recipient key the inbound hand-off was
+    // sealed to; otherwise the firmware HPKE-open of the hand-off would fail.
+    if reseal_key.public_key_sha384 != inbound_key_sha384 {
+        return Err(Error::InvalidArgs(format!(
+            "sealing key `{sealing_key_name}` is not the recipient key for `{reseal}`'s inbound remote hand-off in `{domain}`"
+        )));
+    }
 
     // The destination must be a distinct partition that is not yet a member.
     let dest = dest_ref.partition.as_str();

@@ -233,7 +233,7 @@ fn provision_key_and_report(ws: &TestWs, partition: &str, sealing_key: &str, rep
 
 /// Full cross-partition remote-backup round trip across eight separate
 /// processes: two partitions on a shared authority set, sealing keys and key
-/// reports on both, `create_sd` on the backing partition addressing the
+/// reports on both, `create_remote_backup` on the backing partition addressing the
 /// receiver, then `restore_remote_backup` on the receiver joining the domain.
 #[test]
 fn full_remote_backup_round_trip() {
@@ -244,7 +244,7 @@ fn full_remote_backup_round_trip() {
 
     // Backing partition A creates the domain, addressed to receiver B.
     let create = ws.run(&[
-        "create_sd",
+        "create_remote_backup",
         "--partition",
         "part-a",
         "--secure-domain",
@@ -341,7 +341,7 @@ fn self_backup_single_partition() {
     provision_partition_new_authority(&ws, "solo", "auth-solo", "sk", "rep");
 
     let create = ws.run(&[
-        "create_sd",
+        "create_remote_backup",
         "--partition",
         "solo",
         "--secure-domain",
@@ -371,7 +371,7 @@ fn self_backup_single_partition() {
 
     // A backing partition already in a domain cannot back another one.
     let err = ws.run_expect_fail(&[
-        "create_sd",
+        "create_remote_backup",
         "--partition",
         "solo",
         "--secure-domain",
@@ -397,7 +397,7 @@ fn restore_without_domain_is_rejected() {
     provision_partition_new_authority(&ws, "part-a", "auth-a", "ska", "repa");
     provision_partition_reuse_authority(&ws, "part-b", "auth-a", "skb", "repb");
 
-    // No `create_sd` has run, so domain `ghost` does not exist.
+    // No `create_remote_backup` has run, so domain `ghost` does not exist.
     let err = ws.run_expect_fail(&[
         "restore_remote_backup",
         "--partition",
@@ -431,7 +431,7 @@ fn restore_local_backup_refreshes_recovery_pair() {
 
     provision_partition_new_authority(&ws, "solo", "auth-solo", "sk", "rep");
     ws.run(&[
-        "create_sd",
+        "create_remote_backup",
         "--partition",
         "solo",
         "--secure-domain",
@@ -515,7 +515,7 @@ fn reseal_forwards_domain_to_third_partition() {
 
     // A creates the domain for B; B joins.
     ws.run(&[
-        "create_sd",
+        "create_remote_backup",
         "--partition",
         "part-a",
         "--secure-domain",
@@ -538,7 +538,8 @@ fn reseal_forwards_domain_to_third_partition() {
     ]);
 
     // A partition with no inbound remote backup cannot reseal: A is the backing
-    // member and holds no `remote-backups/part-a.bin`.
+    // member and was never addressed by a remote hand-off, so it has no
+    // `remote-backups/part-a.bin` to open.
     let err = ws.run_expect_fail(&[
         "reseal_remote_backup",
         "--partition",
@@ -553,8 +554,8 @@ fn reseal_forwards_domain_to_third_partition() {
         "part-c/skc/repc",
     ]);
     assert!(
-        err.contains("source remote backup"),
-        "expected missing-source rejection, got:\n{err}"
+        err.contains("no inbound remote hand-off"),
+        "expected missing-hand-off rejection, got:\n{err}"
     );
     assert!(
         !ws.exists("secure-domains/sd-x/remote-backups/part-c.bin"),
@@ -659,6 +660,103 @@ fn reseal_forwards_domain_to_third_partition() {
     );
 }
 
+/// A relay/forwarder never joins the domain: A creates a remote backup addressed
+/// to B, and B reseals it straight on to C directly from that inbound hand-off
+/// without ever running `restore_remote_backup`. This matches the firmware,
+/// whose `sd_reseal_remote_backup` needs only the inbound `pok_remote_backup`,
+/// B's sealing key, and A's sender evidence — never the domain's `sd_mk_backup`
+/// or any local member material. B stays a non-member throughout.
+#[test]
+fn reseal_relays_without_joining() {
+    let ws = TestWs::new();
+
+    // Three partitions on one shared authority set.
+    provision_partition_new_authority(&ws, "part-a", "auth-a", "ska", "repa");
+    provision_partition_reuse_authority(&ws, "part-b", "auth-a", "skb", "repb");
+    provision_partition_reuse_authority(&ws, "part-c", "auth-a", "skc", "repc");
+
+    // A creates the domain addressed to B. B never joins (no restore).
+    ws.run(&[
+        "create_remote_backup",
+        "--partition",
+        "part-a",
+        "--secure-domain",
+        "sd-x",
+        "--sealing-key",
+        "ska",
+        "--receiver-evidence",
+        "part-b/skb/repb",
+    ]);
+
+    // B relays the domain straight to C from its inbound hand-off, without ever
+    // installing it locally.
+    let reseal = ws.run(&[
+        "reseal_remote_backup",
+        "--partition",
+        "part-b",
+        "--secure-domain",
+        "sd-x",
+        "--sealing-key",
+        "skb",
+        "--sender-evidence",
+        "part-a/ska/repa",
+        "--receiver-evidence",
+        "part-c/skc/repc",
+    ]);
+    assert!(
+        reseal.contains("resealed `sd-x` to `part-c`"),
+        "expected reseal summary, got:\n{reseal}"
+    );
+
+    // The relay produced C's outstanding hand-off, sourced by B, but did not add
+    // B as a member and did not install a member area for B.
+    assert!(ws.exists("secure-domains/sd-x/remote-backups/part-c.bin"));
+    assert!(
+        !ws.exists("secure-domains/sd-x/members/part-b"),
+        "relay must not install a member area for B"
+    );
+    let domain = ws.read_json("secure-domains/sd-x/secure-domain.json");
+    let members = domain["members"].as_array().expect("members");
+    assert_eq!(members.len(), 1, "only A is a member after the relay");
+    assert_eq!(members[0]["partition"], "part-a");
+    let part_b = ws.read_json("partitions/part-b/partition.json");
+    assert!(
+        part_b["secure_domain"].is_null(),
+        "B never joined a domain, got:\n{part_b}"
+    );
+
+    // C consumes the relayed hand-off (sealed to C, sourced by B).
+    let restore = ws.run(&[
+        "restore_remote_backup",
+        "--partition",
+        "part-c",
+        "--secure-domain",
+        "sd-x",
+        "--sealing-key",
+        "skc",
+        "--sender-evidence",
+        "part-b/skb/repb",
+    ]);
+    assert!(
+        restore.contains("joined `sd-x`"),
+        "expected join summary, got:\n{restore}"
+    );
+
+    // A and C are members; B relayed the domain without ever joining.
+    let domain = ws.read_json("secure-domains/sd-x/secure-domain.json");
+    let members = domain["members"].as_array().expect("members");
+    let names: Vec<&str> = members
+        .iter()
+        .map(|m| m["partition"].as_str().unwrap_or_default())
+        .collect();
+    assert_eq!(members.len(), 2);
+    assert!(names.contains(&"part-a"));
+    assert!(names.contains(&"part-c"));
+    assert!(!names.contains(&"part-b"), "B relayed without joining");
+    let c_member = ws.read_json("secure-domains/sd-x/members/part-c/member.json");
+    assert_eq!(c_member["source_partition"], "part-b");
+}
+
 /// The peer-backup pair: an existing member (B) hands the domain's BKS3 to a
 /// peer (C) sealed to C's attested key, and C joins by consuming that peer
 /// hand-off via `restore_peer_backup`. Exercises `create_peer_backup` +
@@ -673,7 +771,7 @@ fn peer_backup_admits_new_member() {
 
     // A creates the domain for B; B joins as a member.
     ws.run(&[
-        "create_sd",
+        "create_remote_backup",
         "--partition",
         "part-a",
         "--secure-domain",
@@ -814,7 +912,7 @@ fn show_partitions_lists_domain_membership() {
     provision_partition_reuse_authority(&ws, "part-b", "auth-a", "skb", "repb");
     provision_partition_reuse_authority(&ws, "part-c", "auth-a", "skc", "repc");
     ws.run(&[
-        "create_sd",
+        "create_remote_backup",
         "--partition",
         "part-a",
         "--secure-domain",
@@ -861,6 +959,16 @@ fn show_partitions_lists_domain_membership() {
         "part-a row wrong:\n{}",
         lines[a]
     );
+    // Each sealing key lists its key reports in brackets beside the key name.
+    assert!(
+        lines[0].contains("SEALING KEYS [REPORTS]"),
+        "header should label the reports column, got:\n{out}"
+    );
+    assert!(
+        lines[a].contains("ska [repa]"),
+        "part-a row should show the key report beside the key:\n{}",
+        lines[a]
+    );
     assert!(
         lines[b].contains("sd-x") && lines[b].contains("member"),
         "part-b row wrong:\n{}",
@@ -887,7 +995,7 @@ fn show_secure_domains_renders_lineage() {
 
     // A backs sd-x, B joins, then B reseals to C (outstanding, C not joined).
     ws.run(&[
-        "create_sd",
+        "create_remote_backup",
         "--partition",
         "part-a",
         "--secure-domain",

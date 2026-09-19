@@ -43,7 +43,7 @@ pub enum Command {
     KeyReport(KeyReportArgs),
 
     /// Create a secure domain and its first backups.
-    CreateSd(CreateSdArgs),
+    CreateRemoteBackup(CreateRemoteBackupArgs),
 
     /// Refresh the operating partition's own device-local recovery point.
     RestoreLocalBackup(RestoreLocalBackupArgs),
@@ -117,9 +117,9 @@ pub struct KeyReportArgs {
     pub report_data: Option<PathBuf>,
 }
 
-/// `create_sd` arguments.
+/// `create_remote_backup` arguments.
 #[derive(Debug, clap::Args)]
-pub struct CreateSdArgs {
+pub struct CreateRemoteBackupArgs {
     /// Backing partition that creates the domain.
     #[arg(long, value_name = "NAME")]
     pub partition: String,
