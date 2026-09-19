@@ -1,29 +1,33 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
-//! Working-directory layout helpers.
+//! Workspace layout helpers.
 //!
 //! The layout is defined in the "Partition artifact layout" section of
 //! `api/docs/design-sealing-service-cli.md`. This module resolves the
-//! top-level directories and named artifact roots; artifact I/O and manifest
-//! (de)serialization are added with the command handlers.
+//! top-level directories and named artifact roots within the workspace root.
+//! At runtime the root is a transient scratch directory that
+//! [`crate::container`] unpacks the single-file state container into before a
+//! command runs and repacks afterwards; handlers see an ordinary directory
+//! tree and never touch the container format directly.
 
 use std::path::Path;
 use std::path::PathBuf;
 
-/// A validated handle to a `--working-dir` root.
+/// A validated handle to a workspace root (the scratch directory the state
+/// container is unpacked into for the duration of one command).
 pub struct Workspace {
     root: PathBuf,
 }
 
 impl Workspace {
-    /// Wrap a working-directory root. Existence and permission checks are
-    /// performed by the command handlers that need them.
+    /// Wrap a workspace root. Existence and permission checks are performed by
+    /// the command handlers that need them.
     pub fn new(root: PathBuf) -> Self {
         Self { root }
     }
 
-    /// The working-directory root.
+    /// The workspace root.
     pub fn root(&self) -> &Path {
         &self.root
     }
@@ -241,7 +245,7 @@ impl Workspace {
     }
 
     /// Convert an absolute path under this workspace root into the POSIX,
-    /// working-dir-relative form manifests record.
+    /// workspace-relative form manifests record.
     pub fn relative(&self, abs: &Path) -> Result<String, RelativeError> {
         let rel = abs.strip_prefix(&self.root).map_err(|_| RelativeError)?;
         let mut parts = Vec::new();
@@ -259,7 +263,7 @@ impl Workspace {
 
 /// The path is not a normal descendant of the workspace root.
 #[derive(Debug, thiserror::Error)]
-#[error("path is not under the working directory")]
+#[error("path is not under the workspace root")]
 pub struct RelativeError;
 
 /// A parsed `<partition>/<key>/<report>` evidence reference.

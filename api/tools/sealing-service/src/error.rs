@@ -13,11 +13,6 @@ pub enum Error {
     #[error("command not yet implemented: `{0}`")]
     NotImplemented(&'static str),
 
-    /// A command that operates on a workspace was invoked without the global
-    /// `--working-dir <path>` option.
-    #[error("`{0}` requires the global --working-dir <path> option")]
-    MissingWorkingDir(&'static str),
-
     /// A filesystem operation failed.
     #[error("failed to {action} `{path}`: {source}")]
     Io {

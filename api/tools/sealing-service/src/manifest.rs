@@ -6,7 +6,7 @@
 //! These serialize to the schemas defined in the "Manifest schemas" section of
 //! `api/docs/design-sealing-service-cli.md`. Every manifest is a single
 //! top-level JSON object with `schema_version` `1` and a `kind` tag; all path
-//! values are POSIX and relative to `<working-dir>`; digests are 96-character
+//! values are POSIX and relative to the workspace root; digests are 96-character
 //! lowercase-hex SHA-384; timestamps are RFC 3339 UTC with a `Z` suffix.
 //!
 //! A secure domain is a single BKS3 (root key material), not a version

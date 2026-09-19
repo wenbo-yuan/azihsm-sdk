@@ -4,10 +4,12 @@
 //! End-to-end integration tests for `azihsm-sealing-service`.
 //!
 //! Each command in the sealing-service CLI is a distinct OS process that
-//! exchanges file-based state through a shared `--working-dir`, mirroring the
-//! multi-VM reality on hardware. These tests drive the *built binary* the same
-//! way — one `std::process::Command` spawn per command — so they exercise the
-//! real cross-process split flow rather than in-process helpers.
+//! exchanges state through a single-file workspace container selected by the
+//! `AZIHSM_SEALING_STATE_PATH` environment variable, mirroring the multi-VM
+//! reality on hardware. These tests drive the *built binary* the same way —
+//! one `std::process::Command` spawn per command, each pointed at the same
+//! state file via the env var — so they exercise the real cross-process split
+//! flow rather than in-process helpers.
 //!
 //! The whole suite is gated on the `emu` feature: only the emulator flavor can
 //! run without physical HSM hardware, and the identity-injection layer makes
@@ -22,6 +24,7 @@
 
 #![cfg(feature = "emu")]
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::process::Command;
 use std::process::Output;
@@ -30,38 +33,38 @@ use std::sync::atomic::Ordering;
 
 use serde_json::Value;
 
-/// Monotonic counter to keep concurrent test working-dirs unique.
+/// Monotonic counter to keep concurrent test state files unique.
 static COUNTER: AtomicU32 = AtomicU32::new(0);
 
-/// A disposable, uniquely-named `--working-dir` for one test, plus helpers to
-/// spawn the built CLI against it. Dropped at end of test: the directory and
-/// all runtime artifacts are removed.
+/// A disposable, uniquely-named single-file workspace container for one test,
+/// plus helpers to spawn the built CLI against it. Dropped at end of test: the
+/// state file is removed.
 struct TestWs {
-    dir: PathBuf,
+    state_file: PathBuf,
 }
 
 impl TestWs {
-    /// Create a fresh, empty working directory under the system temp dir.
+    /// Reserve a fresh, unique state-file path under the system temp dir. The
+    /// file itself is created lazily by the first command that writes state.
     fn new() -> Self {
         let n = COUNTER.fetch_add(1, Ordering::Relaxed);
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_nanos())
             .unwrap_or(0);
-        let dir = std::env::temp_dir().join(format!(
-            "azihsm-sealing-e2e-{}-{n}-{nanos}",
+        let state_file = std::env::temp_dir().join(format!(
+            "azihsm-sealing-e2e-{}-{n}-{nanos}.bin",
             std::process::id()
         ));
-        std::fs::create_dir_all(&dir).expect("create temp working dir");
-        Self { dir }
+        Self { state_file }
     }
 
-    /// Spawn the built binary with the given subcommand args and the shared
-    /// `--working-dir`, returning the raw process output.
+    /// Spawn the built binary with the given subcommand args, pointing it at
+    /// this test's state file via `AZIHSM_SEALING_STATE_PATH`, returning the
+    /// raw process output.
     fn raw(&self, args: &[&str]) -> Output {
         Command::new(env!("CARGO_BIN_EXE_azihsm-sealing-service"))
-            .arg("--working-dir")
-            .arg(&self.dir)
+            .env("AZIHSM_SEALING_STATE_PATH", &self.state_file)
             .args(args)
             .output()
             .expect("spawn azihsm-sealing-service")
@@ -92,44 +95,81 @@ impl TestWs {
         String::from_utf8_lossy(&out.stderr).into_owned()
     }
 
-    /// Absolute path of the shared policy a `create_partition` authority set
-    /// wrote, for reuse by a second partition on the same authority set.
-    fn policy_arg(&self, authority_set: &str) -> String {
-        self.dir
-            .join("authority-sets")
-            .join(authority_set)
-            .join("policy.bin")
-            .to_string_lossy()
-            .into_owned()
+    /// Decode the single-file workspace container into a map of POSIX-relative
+    /// path -> file bytes. Returns an empty map when the state file does not
+    /// yet exist (no command has written state).
+    ///
+    /// Mirrors the framing written by `src/container.rs`:
+    /// `magic(8) | count(u32 LE) | [ path_len(u32 LE) | path | data_len(u64 LE) | data ]*`.
+    fn decode(&self) -> BTreeMap<String, Vec<u8>> {
+        let bytes = match std::fs::read(&self.state_file) {
+            Ok(b) => b,
+            Err(_) => return BTreeMap::new(),
+        };
+        let mut map = BTreeMap::new();
+
+        let take = |pos: &mut usize, n: usize| -> Vec<u8> {
+            assert!(*pos + n <= bytes.len(), "truncated container");
+            let slice = bytes[*pos..*pos + n].to_vec();
+            *pos += n;
+            slice
+        };
+
+        assert!(bytes.len() >= 12, "container too short");
+        assert_eq!(&bytes[0..8], b"AZSDBIN1", "bad container magic");
+        let mut pos = 8usize;
+        let count = u32::from_le_bytes(
+            take(&mut pos, 4)
+                .as_slice()
+                .try_into()
+                .expect("count bytes"),
+        );
+        for _ in 0..count {
+            let path_len = u32::from_le_bytes(
+                take(&mut pos, 4)
+                    .as_slice()
+                    .try_into()
+                    .expect("path_len bytes"),
+            ) as usize;
+            let path = String::from_utf8(take(&mut pos, path_len)).expect("utf8 path");
+            let data_len = u64::from_le_bytes(
+                take(&mut pos, 8)
+                    .as_slice()
+                    .try_into()
+                    .expect("data_len bytes"),
+            ) as usize;
+            let data = take(&mut pos, data_len);
+            map.insert(path, data);
+        }
+        map
     }
 
-    /// True when a workspace-relative path exists.
+    /// True when a workspace-relative path exists inside the container.
     fn exists(&self, rel: &str) -> bool {
-        self.abs(rel).exists()
+        self.decode().contains_key(rel)
     }
 
-    /// Parse a workspace-relative JSON manifest.
+    /// Parse a workspace-relative JSON manifest from the container.
     fn read_json(&self, rel: &str) -> Value {
-        let text =
-            std::fs::read_to_string(self.abs(rel)).unwrap_or_else(|e| panic!("read {rel}: {e}"));
-        serde_json::from_str(&text).unwrap_or_else(|e| panic!("parse {rel}: {e}"))
+        let map = self.decode();
+        let bytes = map
+            .get(rel)
+            .unwrap_or_else(|| panic!("missing {rel} in container"));
+        serde_json::from_slice(bytes).unwrap_or_else(|e| panic!("parse {rel}: {e}"))
     }
 
-    fn abs(&self, rel: &str) -> PathBuf {
-        self.dir.join(rel)
-    }
-
-    /// Byte length of a workspace-relative file.
+    /// Byte length of a workspace-relative file inside the container.
     fn file_len(&self, rel: &str) -> u64 {
-        std::fs::metadata(self.abs(rel))
-            .map(|m| m.len())
-            .unwrap_or_else(|e| panic!("stat {rel}: {e}"))
+        let map = self.decode();
+        map.get(rel)
+            .map(|b| b.len() as u64)
+            .unwrap_or_else(|| panic!("stat {rel}"))
     }
 }
 
 impl Drop for TestWs {
     fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.dir);
+        let _ = std::fs::remove_file(&self.state_file);
     }
 }
 
@@ -152,13 +192,13 @@ fn provision_partition_new_authority(
     provision_key_and_report(ws, partition, sealing_key, report);
 }
 
-/// Provision a partition that reuses an existing authority set + policy, then a
-/// sealing key and key report.
+/// Provision a partition that reuses an existing authority set, then a sealing
+/// key and key report. The shared policy is loaded from the workspace
+/// container (no external `--policy` file).
 fn provision_partition_reuse_authority(
     ws: &TestWs,
     partition: &str,
     authority_set: &str,
-    policy: &str,
     sealing_key: &str,
     report: &str,
 ) {
@@ -168,8 +208,6 @@ fn provision_partition_reuse_authority(
         partition,
         "--authority-set",
         authority_set,
-        "--policy",
-        policy,
     ]);
     provision_key_and_report(ws, partition, sealing_key, report);
 }
@@ -202,8 +240,7 @@ fn full_remote_backup_round_trip() {
     let ws = TestWs::new();
 
     provision_partition_new_authority(&ws, "part-a", "auth-a", "ska", "repa");
-    let policy = ws.policy_arg("auth-a");
-    provision_partition_reuse_authority(&ws, "part-b", "auth-a", &policy, "skb", "repb");
+    provision_partition_reuse_authority(&ws, "part-b", "auth-a", "skb", "repb");
 
     // Backing partition A creates the domain, addressed to receiver B.
     let create = ws.run(&[
@@ -358,8 +395,7 @@ fn restore_without_domain_is_rejected() {
     let ws = TestWs::new();
 
     provision_partition_new_authority(&ws, "part-a", "auth-a", "ska", "repa");
-    let policy = ws.policy_arg("auth-a");
-    provision_partition_reuse_authority(&ws, "part-b", "auth-a", &policy, "skb", "repb");
+    provision_partition_reuse_authority(&ws, "part-b", "auth-a", "skb", "repb");
 
     // No `create_sd` has run, so domain `ghost` does not exist.
     let err = ws.run_expect_fail(&[
@@ -474,9 +510,8 @@ fn reseal_forwards_domain_to_third_partition() {
 
     // Three partitions on one shared authority set.
     provision_partition_new_authority(&ws, "part-a", "auth-a", "ska", "repa");
-    let policy = ws.policy_arg("auth-a");
-    provision_partition_reuse_authority(&ws, "part-b", "auth-a", &policy, "skb", "repb");
-    provision_partition_reuse_authority(&ws, "part-c", "auth-a", &policy, "skc", "repc");
+    provision_partition_reuse_authority(&ws, "part-b", "auth-a", "skb", "repb");
+    provision_partition_reuse_authority(&ws, "part-c", "auth-a", "skc", "repc");
 
     // A creates the domain for B; B joins.
     ws.run(&[
@@ -633,9 +668,8 @@ fn peer_backup_admits_new_member() {
     let ws = TestWs::new();
 
     provision_partition_new_authority(&ws, "part-a", "auth-a", "ska", "repa");
-    let policy = ws.policy_arg("auth-a");
-    provision_partition_reuse_authority(&ws, "part-b", "auth-a", &policy, "skb", "repb");
-    provision_partition_reuse_authority(&ws, "part-c", "auth-a", &policy, "skc", "repc");
+    provision_partition_reuse_authority(&ws, "part-b", "auth-a", "skb", "repb");
+    provision_partition_reuse_authority(&ws, "part-c", "auth-a", "skc", "repc");
 
     // A creates the domain for B; B joins as a member.
     ws.run(&[
@@ -777,9 +811,8 @@ fn show_partitions_lists_domain_membership() {
 
     // A backs a domain that B joins; C is provisioned but joins nothing.
     provision_partition_new_authority(&ws, "part-a", "auth-a", "ska", "repa");
-    let policy = ws.policy_arg("auth-a");
-    provision_partition_reuse_authority(&ws, "part-b", "auth-a", &policy, "skb", "repb");
-    provision_partition_reuse_authority(&ws, "part-c", "auth-a", &policy, "skc", "repc");
+    provision_partition_reuse_authority(&ws, "part-b", "auth-a", "skb", "repb");
+    provision_partition_reuse_authority(&ws, "part-c", "auth-a", "skc", "repc");
     ws.run(&[
         "create_sd",
         "--partition",
@@ -849,9 +882,8 @@ fn show_secure_domains_renders_lineage() {
     let ws = TestWs::new();
 
     provision_partition_new_authority(&ws, "part-a", "auth-a", "ska", "repa");
-    let policy = ws.policy_arg("auth-a");
-    provision_partition_reuse_authority(&ws, "part-b", "auth-a", &policy, "skb", "repb");
-    provision_partition_reuse_authority(&ws, "part-c", "auth-a", &policy, "skc", "repc");
+    provision_partition_reuse_authority(&ws, "part-b", "auth-a", "skb", "repb");
+    provision_partition_reuse_authority(&ws, "part-c", "auth-a", "skc", "repc");
 
     // A backs sd-x, B joins, then B reseals to C (outstanding, C not joined).
     ws.run(&[
