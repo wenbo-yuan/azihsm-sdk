@@ -38,7 +38,7 @@ the CLI does not expose a runtime `--backend` selector.
 
 - **Secure domain** — one recoverable key-material identity. Its root is a
   single BKS3 (the 48-byte partition-owner seed the firmware mints in
-  `create_sd`). Every backup artifact this document names — the device-local
+  `create_remote_backup`). Every backup artifact this document names — the device-local
   recovery envelope, the outbound remote backup, a resealed remote backup, a
   peer backup — is a different masking or HPKE-sealed envelope of that **same
   BKS3**. Restore recovers the same BKS3; reseal re-wraps the same BKS3 to a new
@@ -46,7 +46,7 @@ the CLI does not expose a runtime `--backend` selector.
   lifetime, shown non-secretly by its policy SHA-384 and backing-partition PID
   (never by the BKS3 itself).
 - **Backing partition** — the single partition named inside the policy as
-  `backup_part_id`. It is the only partition allowed to run `create_sd` for the
+  `backup_part_id`. It is the only partition allowed to run `create_remote_backup` for the
   domain (firmware enforces `pid == backup_part_id` in
   `sd_create_remote_backup`). "Backing" is a policy fact, not a possession fact:
   even if wiped and rejoined, no other partition can become backing, because the
@@ -59,7 +59,7 @@ the CLI does not expose a runtime `--backend` selector.
   not backing has `pid != backup_part_id`, which is fine because restore, reseal,
   and peer handlers never check `backup_part_id`.
 - **Hand-off backup** — an outbound backup sealed to a *destination* partition
-  that has not yet joined: the remote backup `create_sd` produces for its first
+  that has not yet joined: the remote backup `create_remote_backup` produces for its first
   receiver, a `reseal_remote_backup` output redirected to a new destination, or
   a `create_peer_backup` output for a peer. It carries the same BKS3, sealed to
   the destination's attested public key. The destination becomes a member only
@@ -97,7 +97,7 @@ maps clearly to one sealing-service operation:
 create_partition
 create_sd_sealing_key
 key_report
-create_sd
+create_remote_backup
 restore_local_backup
 restore_remote_backup
 reseal_remote_backup
@@ -114,7 +114,7 @@ The initial example flow is:
 create_partition
 -> create_sd_sealing_key
 -> key_report
--> create_sd
+-> create_remote_backup
 ```
 
 Every arrow is a process boundary. In the `emu` flavor, every command after
@@ -146,24 +146,24 @@ workspace layout below.
 | `create_partition` | `open_session_ex` (bootstrap, default PSK) + `change_psk` + close + `open_session_ex` (reopen, rotated PSK) + `part_init_ex` + `part_final_ex` | `--partition <name>` and either `--new-authority-set <name>` or `--authority-set <name>` (reuse loads the authority set's single stored policy from the container) | Initialized partition workspace: `secrets/co-psk.bin`, PID public key and three PID chains under `attestation/`, `recovery/{mach-seed.bin,part-final-local-mk-backup.bin}` (`emu`); new-mode also writes the authority set and `policy.bin` |
 | `create_sd_sealing_key` | `SdSealingKeyGen` | `--partition <name> --sealing-key <new-key-name>` | `sealing-keys/<key>/{masked-key.bin,public-key.der}` |
 | `key_report` | `KeyReport` | `--partition <name> --sealing-key <key-name> --report <report-name> [--report-data <file>]` | `sealing-keys/<key>/evidence/<report>.bin` (report embedded, no standalone `.cose`) |
-| `create_sd` | `sd_create_remote_backup` | `--partition <backing> --secure-domain <new-domain> --sealing-key <backing-key> --receiver-evidence <ref>` | New `secure-domains/<domain>/` with `members/<backing>/{pok-local-backup,sd-mk-backup}.bin` and `remote-backups/<receiver>.bin` |
+| `create_remote_backup` | `sd_create_remote_backup` | `--partition <backing> --secure-domain <new-domain> --sealing-key <backing-key> --receiver-evidence <ref>` | New `secure-domains/<domain>/` with `members/<backing>/{pok-local-backup,sd-mk-backup}.bin` and `remote-backups/<receiver>.bin` |
 | `restore_local_backup` | `sd_restore_local_backup` | `--partition <name> --secure-domain <domain>` | Refreshed `members/<name>/{pok-local-backup,sd-mk-backup}.bin` (updated in place) |
 | `restore_remote_backup` | `sd_restore_remote_backup` | `--partition <receiver> --secure-domain <domain> --sealing-key <receiver-key> --sender-evidence <ref>` | New `members/<receiver>/{pok-local-backup,sd-mk-backup}.bin`; consumed `remote-backups/<receiver>.bin` |
 | `reseal_remote_backup` | `sd_reseal_remote_backup` | `--partition <name> --secure-domain <domain> --sealing-key <source-receiver-key> --sender-evidence <ref> --receiver-evidence <ref>` | New hand-off `remote-backups/<new-dest>.bin` |
 | `create_peer_backup` | `sd_create_peer_backup` | `--partition <name> --secure-domain <domain> --sealing-key <sender-key> --peer-evidence <ref>` | New hand-off `peer-backups/<dest>.bin` |
 | `restore_peer_backup` | `sd_restore_peer_backup` | `--partition <receiver> --secure-domain <domain> --sealing-key <receiver-key> --peer-evidence <ref>` | New `members/<receiver>/{pok-local-backup,sd-mk-backup}.bin`; consumed `peer-backups/<receiver>.bin` |
 | `help` | none | `[<command>]` | Prints command usage to stdout; no files written |
-| `show_partitions` | none | none (reads the state container) | Prints a per-partition table (authority set, sealing keys, secure domain, SD role) to stdout; no files written |
+| `show_partitions` | none | none (reads the state container) | Prints a per-partition table (authority set, sealing keys with key reports, secure domain, SD role) to stdout; no files written |
 | `show_secure_domains` | none | none (reads the state container) | Prints per-secure-domain membership and hand-off lineage (backing partition, members, outbound hand-offs) to stdout; no files written |
 
-`create_sd` is the user-facing name for the SDK's
+`create_remote_backup` is the user-facing name for the SDK's
 `sd_create_remote_backup` operation. The SDK operation both creates the
 security domain and returns its remote and device-local backup artifacts.
 
-### `create_sd` command contract
+### `create_remote_backup` command contract
 
 ```text
-azihsm-sealing-service create_sd \
+azihsm-sealing-service create_remote_backup \
   --partition <sender-partition> \
   --secure-domain <new-domain-name> \
   --sealing-key <sender-key-name> \
@@ -178,7 +178,7 @@ container to:
 partitions/partition-b/sealing-keys/key-b/evidence/report-1.bin
 ```
 
-Sender evidence is not a separate input to `create_sd`. `key_report` generates
+Sender evidence is not a separate input to `create_remote_backup`. `key_report` generates
 evidence for a sealing key when needed for a later remote restore, reseal, or
 peer operation. In a self-backup, the sender's own evidence is supplied in the
 receiver-evidence role because sender and receiver are the same partition.
@@ -327,7 +327,7 @@ For sender partition A and receiver partition B:
 
 1. A and B are initialized against the same policy and SATA authority.
 2. B generates sealing key B, key report B, and evidence B.
-3. A runs `create_sd` with sealing key A and evidence B. The resulting
+3. A runs `create_remote_backup` with sealing key A and evidence B. The resulting
    `pok_remote_backup` is encrypted to B and authenticated by A.
 4. B runs `restore_remote_backup` with sealing key B, evidence A, the same
    policy, `pok_remote_backup`, and `sd_mk_backup`.
@@ -379,7 +379,7 @@ decoder rejects an incorrect magic value, zero-length fields, truncated or
 trailing bytes, counts above the SDK evidence-chain limit, oversized lengths,
 invalid DER certificates, and malformed COSE_Sign1 reports. Cryptographic
 identity, chain, SATA-anchor, report-signature, and policy-binding checks are
-performed before the bundle is accepted by `create_sd` or another SD command.
+performed before the bundle is accepted by `create_remote_backup` or another SD command.
 
 ### `restore_local_backup` command contract
 
@@ -419,12 +419,12 @@ azihsm-sealing-service restore_remote_backup \
 Maps to `HsmSession::sd_restore_remote_backup(masked_sealing_key,
 sender_evidence, policy, src_remote_backup, prev_sd_mk_backup)`. It runs on the
 receiver partition to admit it into a secure domain created for it by a remote
-`create_sd`. The full flow is described under **Cross-partition remote
+`create_remote_backup`. The full flow is described under **Cross-partition remote
 restore**.
 
 `--sealing-key` selects the receiver's own masked sealing key; its attested
 public key must match the receiver evidence used when the sender ran
-`create_sd`. `--sender-evidence` references the sender's evidence bundle, which
+`create_remote_backup`. `--sender-evidence` references the sender's evidence bundle, which
 authenticates the backup's origin. The policy is loaded from the receiver's
 `partition.json`, not the command line.
 
@@ -458,10 +458,14 @@ azihsm-sealing-service reseal_remote_backup \
 ```
 
 Maps to `HsmSession::sd_reseal_remote_backup(masked_sealing_key, src_evidence,
-dest_evidence, policy, src_remote_backup)`. It runs on a partition that already
-holds the secure domain (for example, the original receiver B) and produces a
-new hand-off addressed to a new destination C. The full flow is described under
-**Cross-partition reseal**.
+dest_evidence, policy, src_remote_backup)`. It runs on any partition addressed
+by an outstanding inbound remote hand-off (for example, the original receiver B)
+and produces a new hand-off addressed to a new destination C. The reseal
+partition need **not** have joined the domain: the firmware recovers the BKS3
+from the inbound `pok_remote_backup` alone and never consumes the domain's
+`sd_mk_backup`, so a pure relay partition can forward the domain without ever
+installing it locally. The full flow is described under **Cross-partition
+reseal**.
 
 `--sealing-key` selects the reseal partition's own masked sealing key, used to
 open the source backup. `--sender-evidence` authenticates the source of the
@@ -474,8 +478,9 @@ The CLI reads `src_remote_backup` from the hand-off this partition can open —
 validates the reseal partition and sealing-key manifests; resolves and
 validates both source and destination evidence, confirming both partition-owner
 chains anchor to the policy SATA and both reports bind to the exact policy
-digest; confirms `--partition` is a member of the domain; and acquires the
-locks.
+digest; confirms `--partition` is addressed by an outstanding inbound remote
+hand-off in the domain (it need not have joined) and that `--sealing-key` is the
+recipient key that hand-off was sealed to; and acquires the locks.
 
 The firmware HPKE-opens the source backup (recovering the **same BKS3**) and
 HPKE-Auth-seals that same BKS3 to the destination. On success the CLI writes the
@@ -484,7 +489,7 @@ the same domain/BKS3, re-wrapped to a new recipient — not a new domain and not
 new recovery point. `secure-domain.json` records the destination as an
 outstanding hand-off; it becomes a member only after it runs
 `restore_remote_backup`. C's `restore_remote_backup` must consume this reseal
-output (sealed to C), not the original `create_sd` hand-off (sealed to B).
+output (sealed to C), not the original `create_remote_backup` hand-off (sealed to B).
 
 ### `create_peer_backup` command contract
 
@@ -719,7 +724,7 @@ and is heavier than necessary; the session-level wrapper is preferred.
 | `create_partition` | Run the initialization flow, including `part_init_ex` and `part_final_ex` without a previous local-MK backup; generate the three test authorities and PID chains; persist the returned `local_mk_backup` and exported artifacts in the named workspace. | Initialize the hardware partition once; generate the same three test authorities and PID chains; export the public partition artifacts under the named host-side partition directory. The resulting partition state remains on the device. |
 | `create_sd_sealing_key` | Reconstruct the named partition with `part_init_ex` and `part_final_ex(prev_local_mk_backup)`, then generate the sealing key. | Generate the sealing key directly on the initialized partition. |
 | `key_report` | Reconstruct the named partition, restore `PartLocalMK`, reconstruct and unmask the persisted sealing-key blob inside the HSM, generate its report, and package the matching evidence bundle. | Reconstruct and unmask the persisted sealing-key blob inside the initialized partition, generate its report, and package the matching evidence bundle. |
-| `create_sd` | Reconstruct the named partition, then create the security domain and write its member area plus the first remote hand-off. | Create the security domain directly on the initialized partition. |
+| `create_remote_backup` | Reconstruct the named partition, then create the security domain and write its member area plus the first remote hand-off. | Create the security domain directly on the initialized partition. |
 | `restore_local_backup` | Reconstruct the named partition, then restore the security domain from the local backups. | Restore directly on the initialized partition. |
 | `restore_remote_backup` | Reconstruct the named partition, then restore the security domain from the remote backup. | Restore directly on the initialized partition. |
 | `reseal_remote_backup` | Reconstruct the named partition, then reseal the source remote backup. | Reseal directly on the initialized partition. |
@@ -843,7 +848,7 @@ BKS3:
   `restore_peer_backup` creates it. `member.json` records the partition's role
   and how it joined.
 - `remote-backups/<destination>.bin` — an outbound hand-off: the BKS3
-  HPKE-sealed to `<destination>`'s attested public key. `create_sd` writes the
+  HPKE-sealed to `<destination>`'s attested public key. `create_remote_backup` writes the
   first one (for its receiver); `reseal_remote_backup` writes further ones for
   new destinations. The file is retained after the destination joins so the
   hand-off lineage remains inspectable; `member.json`/`secure-domain.json`
@@ -867,7 +872,7 @@ updated last through an atomic manifest replacement. In-place refreshes
 write leaves the previous complete recovery point intact.
 
 The initial CLI does not define a special recovery workflow for a hardware
-`create_sd` operation that succeeds in the HSM but encounters a subsequent
+`create_remote_backup` operation that succeeds in the HSM but encounters a subsequent
 host-file write failure. Normal staging and atomic-write precautions still
 apply; cross-device transaction recovery is deferred.
 
@@ -1011,7 +1016,7 @@ artifacts, and named sealing keys.
 Located at `secure-domains/<name>/secure-domain.json`. It records domain
 identity, the policy binding, the backing partition, members with their join
 provenance, and outstanding hand-offs. It is the normative form of the field
-list produced by `create_sd`. Because a domain is one BKS3, there is no version
+list produced by `create_remote_backup`. Because a domain is one BKS3, there is no version
 or generation field.
 
 ```json
@@ -1029,7 +1034,7 @@ or generation field.
       "partition": "part-a",
       "pid": "…",
       "role": "backing",
-      "joined_via": "create_sd",
+      "joined_via": "create_remote_backup",
       "source_partition": null,
       "created_utc": "2026-09-13T18:57:00Z"
     }
@@ -1043,7 +1048,7 @@ or generation field.
       "evidence_ref": "part-b/seal-b/report-b",
       "evidence_sha384": "…",
       "artifact": "secure-domains/sd-1/remote-backups/part-b.bin",
-      "created_by": "create_sd",
+      "created_by": "create_remote_backup",
       "source_partition": "part-a",
       "consumed": false
     }
@@ -1055,19 +1060,19 @@ or generation field.
   backing partition's `backing_policy.sha384`; `secure-domains/<name>/policy.bin`
   is a byte-identical copy of the authority-set policy.
 - `backing_partition` is the single partition named by the policy's
-  `backup_part_id` and is the only partition that could have run `create_sd`.
+  `backup_part_id` and is the only partition that could have run `create_remote_backup`.
 - `backup_scope` is `self` or `cross-partition`. For `self`, the sole hand-off
   destination equals `backing_partition.name` and `members` contains that
   partition once with no outstanding hand-off.
 - `members` lists every partition that currently holds the domain's BKS3, each
   with a `members/<partition>/member.json` counterpart. `role` is `backing`
-  (this partition is `backup_part_id`, joined via `create_sd`) or `member`
+  (this partition is `backup_part_id`, joined via `create_remote_backup`) or `member`
   (joined later via a restore). `joined_via` is the command that installed the
   BKS3 locally; `source_partition` names the partition whose hand-off it
   consumed (`null` for the backing partition).
 - `handoffs` lists every outbound backup addressed to a destination that has not
   necessarily joined yet. `kind` is `remote` or `peer`; `created_by` is
-  `create_sd`, `reseal_remote_backup`, or `create_peer_backup`;
+  `create_remote_backup`, `reseal_remote_backup`, or `create_peer_backup`;
   `source_partition` is the member that produced it; `consumed` flips to `true`
   when the destination runs the matching restore and appears in `members`.
   Hand-off files are retained after consumption so lineage stays inspectable.
@@ -1097,7 +1102,7 @@ self-describing record for one partition's copy of the domain's BKS3.
 ```
 
 - `role` and `joined_via` match this partition's entry in `secure-domain.json`.
-  For the backing partition `role` is `backing`, `joined_via` is `create_sd`,
+  For the backing partition `role` is `backing`, `joined_via` is `create_remote_backup`,
   and `source_partition`/`source_handoff` are `null`.
 - `created_utc` is when the member area was first written (the join);
   `updated_utc` is refreshed every time `restore_local_backup` re-masks the
@@ -1164,7 +1169,7 @@ blob is bound to the platform identity `{svn, owner}` — its anti-rollback
 anchor — not to the PID, so masking and unmasking survive a changed PID on their
 own. The partition identity, by contrast, IS load-bearing for attestation and
 backup: `key_report` signs its report with the partition identity key and binds
-`policy_hash`, and `create_sd` requires the live PID and identity public key to
+`policy_hash`, and `create_remote_backup` requires the live PID and identity public key to
 equal the policy's `backup_part_id` / `backup_part_pub_key`. Because the
 emulator mints a random identity per process, the split flow would otherwise
 present an internally inconsistent evidence bundle across its separate command
@@ -1190,7 +1195,7 @@ backup.
 The identity injection mechanism keeps a partition's identity byte-stable across
 the separate CLI processes of the split flow, so that on the emulator the
 sequence `create_partition` → `create_sd_sealing_key` → `key_report` →
-`create_sd` (each its own process) behaves exactly as it does across separate
+`create_remote_backup` (each its own process) behaves exactly as it does across separate
 hardware VMs. It is **emulator-only** and has **no effect on the hardware path**.
 The firmware and DDI layers live in crates that are only ever built for the
 emulator (`fw/plat/std/*`, `ddi/emu`), so they need no feature gate of their own;
@@ -1204,7 +1209,7 @@ On the emulator the partition identity is minted with a non-seedable RNG at
 (`erase` = `part_disable` + `part_enable`). Each CLI process therefore starts
 from a different identity. That breaks attestation and backup, which are
 identity-bound: `key_report` signs its report with the partition identity key,
-and `create_sd` checks the live PID and identity public key against the policy's
+and `create_remote_backup` checks the live PID and identity public key against the policy's
 `backup_part_id` / `backup_part_pub_key`. Without a stable identity the evidence
 produced by one process cannot be verified against the policy or chains anchored
 in another. Hardware does not have this problem because a real partition retains
@@ -1365,14 +1370,16 @@ azihsm-sealing-service show_secure_domains
 
 `show_partitions` scans the versioned manifests beneath `partitions/` and
 correlates each partition with the secure domain it belongs to, printing a
-deterministically sorted per-partition table. The `SD ROLE` column is `backing`
-or `member` when the partition holds a domain, and `-` otherwise:
+deterministically sorted per-partition table. Each sealing key is listed with
+its recorded key reports in brackets (`key_1 [rep_1, rep_2]`). The `SD ROLE`
+column is `backing` or `member` when the partition holds a domain, and `-`
+otherwise:
 
 ```text
-PARTITION    AUTHORITY SET  SEALING KEYS        SECURE DOMAIN    SD ROLE
-partition_1  prod-a         key_1, key_2, key_3 secure_domain_1  backing
-partition_2  prod-a         key_4               secure_domain_1  member
-partition_3  prod-a         -                   -                -
+PARTITION    AUTHORITY SET  SEALING KEYS [REPORTS]           SECURE DOMAIN    SD ROLE
+partition_1  prod-a         key_1 [rep_1], key_2, key_3      secure_domain_1  backing
+partition_2  prod-a         key_4 [rep_4]                    secure_domain_1  member
+partition_3  prod-a         -                                -                -
 ```
 
 `show_secure_domains` scans `secure-domains/` and renders, per domain, the
@@ -1383,10 +1390,10 @@ the domain and how every other member joined:
 ```text
 SECURE DOMAIN  secure_domain_1   (policy ab12…, backing partition_1)
   members
-    partition_1  backing  create_sd                          (root)
+    partition_1  backing  create_remote_backup                          (root)
     partition_2  member   restore_remote  <- partition_1
   hand-offs
-    remote  partition_2  create_sd          from partition_1  consumed
+    remote  partition_2  create_remote_backup          from partition_1  consumed
     remote  partition_3  reseal             from partition_1  outstanding
     peer    partition_4  create_peer        from partition_1  outstanding
 ```
@@ -1499,7 +1506,7 @@ across processes so the split flow behaves like hardware. Built without
 Coverage:
 
 - `full_remote_backup_round_trip` — two partitions on a shared authority set,
-  sealing keys and key reports on both, `create_sd` on the backing partition
+  sealing keys and key reports on both, `create_remote_backup` on the backing partition
   addressed to the receiver, then `restore_remote_backup` on the receiver.
   Asserts the receiver's member area, the domain membership and consumed
   hand-off, the receiver's recorded membership, and that a second restore is
@@ -1519,6 +1526,12 @@ Coverage:
   `restore_remote_backup`. Asserts the outstanding hand-off is sourced by B, C
   joins as a third member with lineage back to B, a partition with no inbound
   backup cannot reseal, and resealing to an existing member is rejected.
+- `reseal_relays_without_joining` — a relay chain: A creates the domain
+  addressed to B, and B reseals it straight to C **without** ever running
+  `restore_remote_backup`. Asserts the reseal succeeds from B's inbound hand-off
+  alone (matching the firmware), B is never added as a member and gets no member
+  area, and after C restores the domain holds exactly A and C with C's lineage
+  back to B.
 - `peer_backup_admits_new_member` — the peer-backup pair: member B hands the
   domain's BKS3 to peer C (sealed to C's attested key) via `create_peer_backup`,
   and C joins by consuming that peer hand-off via `restore_peer_backup`. Asserts

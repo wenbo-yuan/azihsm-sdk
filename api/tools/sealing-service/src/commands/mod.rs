@@ -8,7 +8,7 @@
 
 mod create_partition;
 mod create_peer_backup;
-mod create_sd;
+mod create_remote_backup;
 mod create_sd_sealing_key;
 mod key_report;
 mod reseal_remote_backup;
@@ -59,7 +59,7 @@ fn run_command(command: &Command, workspace: &Workspace) -> Result<()> {
         Command::CreatePartition(args) => create_partition::run(workspace, args),
         Command::CreateSdSealingKey(args) => create_sd_sealing_key::run(workspace, args),
         Command::KeyReport(args) => key_report::run(workspace, args),
-        Command::CreateSd(args) => create_sd::run(workspace, args),
+        Command::CreateRemoteBackup(args) => create_remote_backup::run(workspace, args),
         Command::RestoreLocalBackup(args) => restore_local_backup::run(workspace, args),
         Command::RestoreRemoteBackup(args) => restore_remote_backup::run(workspace, args),
         Command::ResealRemoteBackup(args) => reseal_remote_backup::run(workspace, args),

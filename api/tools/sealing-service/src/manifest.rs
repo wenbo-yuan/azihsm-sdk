@@ -51,7 +51,7 @@ pub struct NamedArtifact {
 #[serde(rename_all = "kebab-case")]
 pub enum Role {
     /// The single partition named by the policy's `backup_part_id`; the only
-    /// partition allowed to run `create_sd` for the domain.
+    /// partition allowed to run `create_remote_backup` for the domain.
     Backing,
     /// A partition that joined later via a restore and holds the same BKS3.
     Member,
@@ -61,7 +61,7 @@ pub enum Role {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum HandoffKind {
-    /// A remote backup produced by `create_sd` or `reseal_remote_backup`.
+    /// A remote backup produced by `create_remote_backup` or `reseal_remote_backup`.
     Remote,
     /// A peer backup produced by `create_peer_backup`.
     Peer,

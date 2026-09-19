@@ -4,7 +4,7 @@
 //! Shared partition-reconstruction helper.
 //!
 //! Every command that operates on an initialized partition
-//! (`create_sd_sealing_key`, `key_report`, `create_sd`, the restore/reseal/peer
+//! (`create_sd_sealing_key`, `key_report`, `create_remote_backup`, the restore/reseal/peer
 //! flows) first opens the operating Crypto-Officer session. On the `emu` flavor
 //! that replays the full reconstruction (reset, rotated-PSK session setup,
 //! `part_init_ex` / `part_final_ex` with the persisted recovery material, and

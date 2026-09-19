@@ -1,7 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
-//! `create_sd` — mint a new security domain from a backing partition.
+//! `create_remote_backup` — mint a new security domain from a backing partition.
 //!
 //! Reconstructs the backing partition (emulator replay or direct `hw` open),
 //! runs `sd_create_remote_backup` over the backing partition's masked sealing
@@ -14,7 +14,7 @@
 //! backup it addresses a distinct receiver that joins later via a remote
 //! restore.
 
-use crate::cli::CreateSdArgs;
+use crate::cli::CreateRemoteBackupArgs;
 use crate::crypto::certs;
 use crate::error::Error;
 use crate::error::Result;
@@ -36,8 +36,8 @@ use crate::util;
 use crate::workspace::EvidenceRef;
 use crate::workspace::Workspace;
 
-/// Run `create_sd`.
-pub fn run(ws: &Workspace, args: &CreateSdArgs) -> Result<()> {
+/// Run `create_remote_backup`.
+pub fn run(ws: &Workspace, args: &CreateRemoteBackupArgs) -> Result<()> {
     let backing = args.partition.as_str();
     let domain = args.secure_domain.as_str();
     let sealing_key_name = args.sealing_key.as_str();
@@ -188,7 +188,7 @@ pub fn run(ws: &Workspace, args: &CreateSdArgs) -> Result<()> {
         partition: backing.to_owned(),
         pid: backing_manifest.pid.clone(),
         role: Role::Backing,
-        joined_via: "create_sd".to_owned(),
+        joined_via: "create_remote_backup".to_owned(),
         source_partition: None,
         source_handoff: None,
         created_utc: now.clone(),
@@ -225,7 +225,7 @@ pub fn run(ws: &Workspace, args: &CreateSdArgs) -> Result<()> {
             partition: backing.to_owned(),
             pid: backing_manifest.pid.clone(),
             role: Role::Backing,
-            joined_via: "create_sd".to_owned(),
+            joined_via: "create_remote_backup".to_owned(),
             source_partition: None,
             created_utc: now.clone(),
         }],
@@ -237,7 +237,7 @@ pub fn run(ws: &Workspace, args: &CreateSdArgs) -> Result<()> {
             evidence_ref: args.receiver_evidence.clone(),
             evidence_sha384,
             artifact: rel(ws, &remote_backup_path)?,
-            created_by: "create_sd".to_owned(),
+            created_by: "create_remote_backup".to_owned(),
             source_partition: backing.to_owned(),
             consumed: is_self,
         }],
@@ -269,7 +269,7 @@ fn print_summary(
     result: &azihsm_api::HsmSdRemoteBackupResult,
 ) {
     let scope = if is_self { "self" } else { "cross-partition" };
-    println!("create_sd: created `{domain}` backed by `{backing}` ({scope})");
+    println!("create_remote_backup: created `{domain}` backed by `{backing}` ({scope})");
     println!("  receiver:          {receiver}");
     println!(
         "  pok_remote_backup: {} bytes",

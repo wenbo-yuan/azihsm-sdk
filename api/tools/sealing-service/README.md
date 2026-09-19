@@ -63,13 +63,13 @@ filesystem paths — they address entries inside the state container.
 | `create_partition` | Initialize a partition workspace and its attestation artifacts | authority set / policy | `partitions/<p>/` (`attestation/`, `secrets/co-psk.bin`, `recovery/`); new-authority mode also writes `authority-sets/<a>/` + `policy.bin` |
 | `create_sd_sealing_key` | Generate a named SD sealing key on a partition | partition manifest | `sealing-keys/<key>/{masked-key,public-key}` |
 | `key_report` | Produce an attestation evidence bundle for a sealing key | sealing key | `sealing-keys/<key>/evidence/<report>.bin` |
-| `create_sd` | Create a secure domain and its first backups (backing partition only) | backing sealing key, receiver evidence | `secure-domains/<d>/` with `members/<backing>/{pok-local-backup,sd-mk-backup}.bin` + `remote-backups/<receiver>.bin` |
+| `create_remote_backup` | Create a secure domain and its first backups (backing partition only) | backing sealing key, receiver evidence | `secure-domains/<d>/` with `members/<backing>/{pok-local-backup,sd-mk-backup}.bin` + `remote-backups/<receiver>.bin` |
 | `restore_local_backup` | Refresh the operating partition's own device-local recovery point | member's own recovery pair | `members/<p>/{pok-local-backup,sd-mk-backup}.bin` (in place) |
 | `restore_remote_backup` | Join a domain from a remote hand-off addressed to this partition | receiver sealing key, sender evidence, `remote-backups/<receiver>.bin` | `members/<receiver>/…`; consumes the inbound hand-off |
 | `reseal_remote_backup` | Re-wrap a domain's BKS3 to a new destination partition | source sealing key, source + receiver evidence | new hand-off `remote-backups/<new-dest>.bin` |
 | `create_peer_backup` | Produce a peer hand-off for another partition in the domain | sender sealing key, peer evidence | new hand-off `peer-backups/<dest>.bin` |
 | `restore_peer_backup` | Join a domain from a peer hand-off addressed to this partition | receiver sealing key, peer evidence, `peer-backups/<receiver>.bin` | `members/<receiver>/…`; consumes the inbound hand-off |
-| `show_partitions` | Print a per-partition inventory table | all partition + domain manifests | stdout only |
+| `show_partitions` | Print a per-partition inventory table (sealing keys with their key reports) | all partition + domain manifests | stdout only |
 | `show_secure_domains` | Print per-domain membership and hand-off lineage | all domain manifests | stdout only |
 | `help` | Print usage for the tool or one command | — | stdout only |
 
@@ -101,7 +101,7 @@ $BIN create_sd_sealing_key --partition p1 --sealing-key k1
 $BIN key_report --partition p1 --sealing-key k1 --report r1
 
 # 3. Create a secure domain backed by p1, addressed to itself (self-backup).
-$BIN create_sd \
+$BIN create_remote_backup \
     --partition p1 --secure-domain sd1 --sealing-key k1 --receiver-evidence p1/k1/r1
 
 # 4. Inspect the workspace.
@@ -111,7 +111,7 @@ $BIN show_secure_domains
 
 To admit a *second* partition, provision it against the **same** authority set
 (its single stored policy is loaded from the state container automatically), then
-run `create_sd` on the backing partition addressed to the new partition's
+run `create_remote_backup` on the backing partition addressed to the new partition's
 evidence, and `restore_remote_backup` on the new partition:
 
 ```bash
@@ -120,7 +120,7 @@ $BIN create_sd_sealing_key --partition p2 --sealing-key k2
 $BIN key_report --partition p2 --sealing-key k2 --report r2
 
 # Backing p1 hands off to p2; p2 joins.
-$BIN create_sd \
+$BIN create_remote_backup \
     --partition p1 --secure-domain sd1 --sealing-key k1 --receiver-evidence p2/k2/r2
 $BIN restore_remote_backup \
     --partition p2 --secure-domain sd1 --sealing-key k2 --sender-evidence p1/k1/r1
@@ -194,10 +194,10 @@ and/or on the JSON manifests inside the container.
 - **Partitions:** `part-a` (backing) and `part-b` (receiver) on a shared
   authority set.
 - **Writes:** provisions both partitions (sealing keys + key reports); `part-a`
-  runs `create_sd` (domain `sd-x`, `members/part-a/…`, outstanding
+  runs `create_remote_backup` (domain `sd-x`, `members/part-a/…`, outstanding
   `remote-backups/part-b.bin`); `part-b` runs `restore_remote_backup`, writing
   `members/part-b/{pok-local-backup,sd-mk-backup}.bin` and consuming the hand-off.
-- **Reads back:** `create_sd` reports a cross-partition scope; before the
+- **Reads back:** `create_remote_backup` reports a cross-partition scope; before the
   restore the hand-off exists and `part-b` is not yet a member; after it, the
   join summary prints, `part-b`'s member artifacts exist, and `member.json`
   records `role=member`, `joined_via=restore_remote_backup`,
@@ -208,14 +208,14 @@ and/or on the JSON manifests inside the container.
 
 #### `self_backup_single_partition` — 1 partition
 - **Partitions:** `solo`, which names *itself* as receiver.
-- **Writes:** provisions `solo`; `create_sd` with `--receiver-evidence solo/sk/rep`
+- **Writes:** provisions `solo`; `create_remote_backup` with `--receiver-evidence solo/sk/rep`
   creates domain `sd-solo` with `backup_scope=self`.
-- **Reads back:** `create_sd` reports the `(self)` scope; the domain manifest has
+- **Reads back:** `create_remote_backup` reports the `(self)` scope; the domain manifest has
   a single backing member and a hand-off that is consumed on creation. A backing
   partition already in a domain cannot back a second one (rejected).
 
 #### `restore_without_domain_is_rejected` — 2 partitions
-- **Partitions:** `part-a` and `part-b`, provisioned but with **no** `create_sd`.
+- **Partitions:** `part-a` and `part-b`, provisioned but with **no** `create_remote_backup`.
 - **Writes:** provisioning only; a `restore_remote_backup` against the
   nonexistent domain `ghost` must fail without mutating state.
 - **Reads back:** no member area is created, and `part-b`'s `partition.json`
@@ -244,6 +244,18 @@ and/or on the JSON manifests inside the container.
   sourced by `part-b`, and `created_by=reseal_remote_backup`. After `part-c`
   restores, the domain has three members and `part-c`'s lineage points back to
   `part-b`; resealing again to an existing member is rejected.
+
+#### `reseal_relays_without_joining` — 3 partitions
+- **Partitions:** `part-a` (backing) → `part-b` (relay, never joins) → `part-c`
+  (new destination).
+- **Writes:** `part-a` creates `sd-x` addressed to `part-b`; `part-b` reseals
+  straight to `part-c` **without** running `restore_remote_backup`, writing an
+  outstanding `remote-backups/part-c.bin`; `part-c` consumes it.
+- **Reads back:** the reseal succeeds even though `part-b` never joined
+  (matching the firmware, which needs only the inbound `pok_remote_backup`);
+  `part-b` is not added as a member and has no member area; after `part-c`
+  restores, the domain has exactly `part-a` and `part-c` as members and
+  `part-c`'s lineage points back to `part-b`.
 
 #### `peer_backup_admits_new_member` — 3 partitions
 - **Partitions:** `part-a` (backing), `part-b` (member), `part-c` (peer joiner).

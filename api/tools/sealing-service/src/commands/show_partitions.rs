@@ -6,10 +6,11 @@
 //! A read-only workspace command. It scans the versioned `partition.json`
 //! manifests beneath `partitions/`, correlates each partition with the secure
 //! domain it belongs to (and its role within that domain), and prints a
-//! deterministically sorted table. It reads metadata and artifact names only:
-//! it never replays a partition, opens an HSM session, reads secret contents,
-//! or modifies the workspace. A missing or invalid manifest is reported as an
-//! inventory error rather than silently omitted.
+//! deterministically sorted table. Each sealing key is listed with its recorded
+//! key reports in brackets (`ska [repa, rep2]`). It reads metadata and artifact
+//! names only: it never replays a partition, opens an HSM session, reads secret
+//! contents, or modifies the workspace. A missing or invalid manifest is
+//! reported as an inventory error rather than silently omitted.
 
 use std::collections::HashMap;
 
@@ -57,7 +58,19 @@ pub fn run(ws: &Workspace) -> Result<()> {
         } else {
             part.sealing_keys
                 .iter()
-                .map(|k| k.name.clone())
+                .map(|k| {
+                    if k.reports.is_empty() {
+                        k.name.clone()
+                    } else {
+                        let reports = k
+                            .reports
+                            .iter()
+                            .map(|r| report_name(r))
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        format!("{} [{}]", k.name, reports)
+                    }
+                })
                 .collect::<Vec<_>>()
                 .join(", ")
         };
@@ -120,12 +133,22 @@ fn role_str(role: Role) -> &'static str {
     }
 }
 
+/// Extract the bare report name from a stored evidence artifact path
+/// (`partitions/<p>/sealing-keys/<k>/evidence/<report>.bin` -> `<report>`).
+fn report_name(artifact: &str) -> String {
+    std::path::Path::new(artifact)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or(artifact)
+        .to_owned()
+}
+
 /// Render the inventory as a left-aligned, column-padded table.
 fn print_table(rows: &[Row]) {
     const HEADERS: [&str; 5] = [
         "PARTITION",
         "AUTHORITY SET",
-        "SEALING KEYS",
+        "SEALING KEYS [REPORTS]",
         "SECURE DOMAIN",
         "SD ROLE",
     ];

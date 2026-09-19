@@ -3,7 +3,7 @@
 
 //! `restore_remote_backup` — admit a receiver partition into a secure domain.
 //!
-//! Runs on the receiver partition addressed by an outstanding `create_sd`
+//! Runs on the receiver partition addressed by an outstanding `create_remote_backup`
 //! hand-off. Reconstructs the receiver (emulator replay or direct `hw` open),
 //! runs `sd_restore_remote_backup` over the receiver's masked sealing key, the
 //! sender's evidence bundle, the policy, the hand-off `pok_remote_backup`, and
