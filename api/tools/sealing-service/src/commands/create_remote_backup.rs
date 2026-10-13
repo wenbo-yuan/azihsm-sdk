@@ -14,6 +14,8 @@
 //! backup it addresses a distinct receiver that joins later via a remote
 //! restore.
 
+use azihsm_ddi_tbor_types::PartPolicy;
+
 use crate::cli::CreateRemoteBackupArgs;
 use crate::crypto::certs;
 use crate::error::Error;
@@ -149,15 +151,20 @@ pub fn run(ws: &Workspace, args: &CreateRemoteBackupArgs) -> Result<()> {
     // Open the operating session (emu reconstructs; hw opens directly).
     let operating = reconstruct::open(ws, &backing_manifest)?;
 
+    // The SDK now takes a typed `&PartPolicy` view and the receiver cert chain
+    // as a separate argument before the evidence.
+    let part_policy = PartPolicy::ref_from_wire(&policy_bytes)
+        .ok_or_else(|| Error::Internal("backing policy is not a valid PartPolicy".to_owned()))?;
+
     // One-shot HSM operation: create the domain from the masked key, the
-    // receiver evidence, and the policy. The firmware performs the
-    // authoritative evidence, SATA-anchor, report-signature and policy-binding
-    // checks; a failure surfaces as an HSM error.
+    // receiver cert chain, the receiver evidence, and the policy. The firmware
+    // performs the authoritative evidence, SATA-anchor, report-signature and
+    // policy-binding checks; a failure surfaces as an HSM error.
     let result = bundle
-        .with_hsm_evidence(|ev| {
+        .with_create_backup(|rcvr_chain, ev| {
             operating
                 .session
-                .sd_create_remote_backup(&masked, ev, &policy_bytes)
+                .sd_create_remote_backup(part_policy, &masked, rcvr_chain, ev)
         })
         .map_err(|e| Error::hsm("sd_create_remote_backup", format!("{e:?}")))?;
 

@@ -12,8 +12,10 @@
 
 use azihsm_ddi_tbor_types::KEY_REPORT_DATA_LEN;
 
+use crate::authority::AuthoritySet;
 use crate::cli::KeyReportArgs;
 use crate::crypto::certs;
+use crate::crypto::certs::RAW_PUB_LEN;
 use crate::error::Error;
 use crate::error::Result;
 use crate::evidence::EvidenceBundle;
@@ -105,11 +107,28 @@ pub fn run(ws: &Workspace, args: &KeyReportArgs) -> Result<()> {
         ],
     )?;
 
+    // Mint the sealing-key certificate chain (spec `RcvrCertChain` /
+    // `SndrCertChain`): a SATA-anchored root → leaf chain whose leaf certifies
+    // the sealing key's own public key (`RcvrPub`), the key a remote backup is
+    // HPKE-sealed to. The firmware recovers `RcvrPub` from this chain under the
+    // policy SATA anchor; the three identity chains above are verified only
+    // when the policy sets `require_trusted_sa_key`.
+    let authset = AuthoritySet::load(ws, &part_manifest.authority_set)?;
+    let sealing_pub_der =
+        reconstruct::read_workspace_file(ws, &part_manifest.sealing_keys[key_index].public_key)?;
+    let sealing_pub_sec1 = certs::pub_sec1_from_spki(&sealing_pub_der)
+        .map_err(|e| Error::Internal(format!("parse sealing key public key: {e}")))?;
+    let mut sealing_pub_raw = [0u8; RAW_PUB_LEN];
+    sealing_pub_raw.copy_from_slice(&sealing_pub_sec1[1..]);
+    let sealing_chain = certs::make_chain(&authset.sata, &sealing_pub_raw);
+    let sealing_key_chain = vec![sealing_chain.root_der, sealing_chain.leaf_der];
+
     // Package and persist the evidence bundle.
     let bundle = EvidenceBundle::new(
         manufacturer_chain,
         owner_chain,
         partition_owner_chain,
+        sealing_key_chain,
         report,
     );
     let encoded = bundle.encode();

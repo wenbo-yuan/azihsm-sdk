@@ -13,6 +13,8 @@
 //! minted; the peer holds the same BKS3 as the rest of the domain. Gated by the
 //! domain's `allow_peer_cloning` policy flag, which the firmware enforces.
 
+use azihsm_ddi_tbor_types::PartPolicy;
+
 use crate::cli::RestorePeerBackupArgs;
 use crate::crypto::certs;
 use crate::error::Error;
@@ -165,6 +167,10 @@ pub fn run(ws: &Workspace, args: &RestorePeerBackupArgs) -> Result<()> {
     // Open the operating session (emu reconstructs; hw opens directly).
     let operating = reconstruct::open(ws, &receiver_manifest)?;
 
+    // The SDK now takes a typed `&PartPolicy` view first; no cert chain here.
+    let part_policy = PartPolicy::ref_from_wire(&policy_bytes)
+        .ok_or_else(|| Error::Internal("receiver policy is not a valid PartPolicy".to_owned()))?;
+
     // One-shot HSM operation: HPKE-open the peer hand-off with the receiver's
     // key, authenticated by the source-peer evidence, and recover the domain
     // BKS3. The firmware performs the authoritative evidence, SATA-anchor,
@@ -172,9 +178,9 @@ pub fn run(ws: &Workspace, args: &RestorePeerBackupArgs) -> Result<()> {
     let restored = bundle
         .with_hsm_evidence(|ev| {
             operating.session.sd_restore_peer_backup(
+                part_policy,
                 &masked,
                 ev,
-                &policy_bytes,
                 &pok_peer_backup,
                 &prev_sd_mk_backup,
             )

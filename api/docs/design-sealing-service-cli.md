@@ -200,8 +200,8 @@ Before invoking the one-shot HSM operation, the CLI:
    referenced files.
 2. Resolves and validates receiver evidence when supplied.
 3. Parses the receiver evidence certificates and COSE_Sign1 key report.
-4. Confirms that the three chains in the bundle share the report-signing PID
-   public key.
+4. Confirms that the three identity chains in the bundle share the
+   report-signing PID public key.
 5. Confirms that the partition-owner chain anchors to the policy SATA.
 6. Confirms that the v2 report binds to the exact policy digest.
 7. Confirms that the secure-domain workspace does not exist and that the
@@ -227,13 +227,24 @@ hand-off destination and becomes a member only after a successful remote
 restore. For a self-backup, backing and receiver are the same partition, which
 is the sole member and has no outstanding hand-off.
 
-`HsmSdEvidence` consists of a manufacturer certificate chain, owner
-certificate chain, partition-owner certificate chain, and key report.
-After running `KeyReport`, `key_report` packages these four inputs into a
-single serializable evidence bundle so evidence generated for one partition
-can be supplied to operations on another partition. The key report is retained
-only inside that bundle; no standalone COSE_Sign1 report file is written. The
-bundle does not contain the sealing private key or any masking key.
+The evidence bundle persisted by `key_report` holds four DER certificate
+chains plus the key report. Three are partition-identity chains — the
+manufacturer, owner, and partition-owner chains whose leaves all certify the
+report-signing PID public key. The fourth is the **sealing-key chain** (spec
+`RcvrCertChain` / `SndrCertChain`), whose leaf certifies the sealing-key public
+key. `key_report` packages these five inputs into a single serializable bundle
+(format tag `AZSDEV02`) so evidence generated for one partition can be supplied
+to operations on another partition. The key report is retained only inside that
+bundle; no standalone COSE_Sign1 report file is written. The bundle does not
+contain the sealing private key or any masking key.
+
+Per the PR #764 contract, the secure-domain operations consume the bundle as
+two firmware arguments: the sealing-key chain is passed as the dedicated
+certificate-chain argument (`receiver_cert_chain` / `sender_cert_chain`), from
+which firmware recovers the sealing-key public key, and the three identity
+chains plus report are passed as the `HsmSdEvidence` argument. The evidence
+argument is optional in the firmware contract; this CLI always supplies the
+full evidence.
 
 No secure-domain command consumes a bare key report; every flow reads the
 report through the `report` field of the evidence bundle. The embedded report
@@ -267,10 +278,11 @@ The PTA CSR/report returned by `part_init_ex` and the POTA-to-PTA chain passed
 to `part_final_ex` are separate partition-finalization artifacts; they do not
 replace these three evidence chains.
 
-After its HSM report operation, `key_report` loads the three chains from the
-selected partition artifact directory and verifies that all four artifacts
-(the three chain leaves plus the persisted PID public key) identify the same
-PID public key. The report's policy binding is satisfied by construction: the
+After its HSM report operation, `key_report` loads the three identity chains
+from the selected partition artifact directory, builds the sealing-key chain
+for the attested sealing-key public key, and verifies that the three identity
+leaves plus the persisted PID public key all identify the same PID public key.
+The report's policy binding is satisfied by construction: the
 report is freshly generated on the just-reconstructed partition, which was
 initialized with the recorded backing policy. Packaging the evidence requires
 no additional HSM operation.
@@ -434,7 +446,7 @@ signature but has no prior member area on a first join; the CLI passes the
 domain's current `sd_mk_backup` state per the SDK contract. Before the one-shot
 HSM call it validates the receiver partition and sealing-key manifests;
 resolves and cryptographically validates sender evidence (shared PID across its
-three chains, partition-owner chain anchored to the policy SATA, report bound to
+three identity chains, partition-owner chain anchored to the policy SATA, report bound to
 the exact policy digest); confirms the receiver is an outstanding hand-off
 destination and not yet a member; and acquires the workspace and partition
 locks.
@@ -1184,7 +1196,13 @@ input: step 4 rebuilds an equivalent chain each time by signing the CSR that
 `part_init_ex` returns with the persisted POTA private key. Re-signing may vary
 the ECDSA signature, certificate serial, and validity dates, which the HSM does
 not require to be byte-identical — it validates the chain against the POTA
-anchor in the policy and the PTA public key.
+anchor in the policy and the PTA public key. The PTA leaf subject, however, is
+not free-form: firmware requires a single `commonName` (64 bytes) RDN equal to
+`"Azure Integrated HSM PTA " ‖ hex(PTAID)`, where
+`PTAID = SHA-384(b"AZIHSM-PTAID-v1" ‖ SEC1_pub)[..16]`, space-padded to 64
+bytes. The CLI derives this deterministic subject from the PTA public key when
+assembling the intermediate; a mismatched subject makes `part_final_ex` reject
+the chain.
 
 The `part_final_ex` local-MK backup is security-domain reconstruction state.
 It is not a partition session credential and it is not an SD local-restore

@@ -12,6 +12,8 @@
 //! member, and marks the consumed hand-off as joined. No new domain is minted;
 //! the receiver holds the same BKS3 as the backing partition.
 
+use azihsm_ddi_tbor_types::PartPolicy;
+
 use crate::cli::RestoreRemoteBackupArgs;
 use crate::crypto::certs;
 use crate::error::Error;
@@ -164,16 +166,22 @@ pub fn run(ws: &Workspace, args: &RestoreRemoteBackupArgs) -> Result<()> {
     // Open the operating session (emu reconstructs; hw opens directly).
     let operating = reconstruct::open(ws, &receiver_manifest)?;
 
+    // The SDK now takes a typed `&PartPolicy` view and the sender cert chain
+    // as a separate argument before the evidence.
+    let part_policy = PartPolicy::ref_from_wire(&policy_bytes)
+        .ok_or_else(|| Error::Internal("receiver policy is not a valid PartPolicy".to_owned()))?;
+
     // One-shot HSM operation: HPKE-open the hand-off with the receiver's key,
-    // authenticated by the sender evidence, and recover the domain BKS3. The
-    // firmware performs the authoritative evidence, SATA-anchor,
-    // report-signature and policy-binding checks.
+    // authenticated by the sender cert chain and evidence, and recover the
+    // domain BKS3. The firmware performs the authoritative evidence,
+    // SATA-anchor, report-signature and policy-binding checks.
     let restored = bundle
-        .with_hsm_evidence(|ev| {
+        .with_restore_backup(|sndr_chain, ev| {
             operating.session.sd_restore_remote_backup(
+                part_policy,
                 &masked,
+                sndr_chain,
                 ev,
-                &policy_bytes,
                 &src_remote_backup,
                 &prev_sd_mk_backup,
             )

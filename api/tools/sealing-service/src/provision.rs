@@ -35,6 +35,7 @@ use azihsm_api::HsmSessionPsk;
 use azihsm_api::PSK_LEN;
 use azihsm_ddi_tbor_types::MACH_SEED_LEN;
 use azihsm_ddi_tbor_types::PART_POLICY_LEN;
+use azihsm_ddi_tbor_types::PartPolicy;
 
 use crate::authority::AuthoritySet;
 use crate::crypto::certs;
@@ -163,10 +164,15 @@ fn init_and_finalize(
     mach_seed: &[u8; MACH_SEED_LEN],
     prev_local_mk: Option<&[u8]>,
 ) -> Result<Vec<u8>> {
+    // The SDK now takes a typed `&PartPolicy` zero-copy view over the policy
+    // image; the on-disk byte format is unchanged.
+    let part_policy = PartPolicy::ref_from_wire(policy)
+        .ok_or_else(|| Error::Internal("policy image is not a valid PartPolicy".to_owned()))?;
+
     let init = session
         .part_init_ex(
+            part_policy,
             mach_seed,
-            policy,
             &policy::pota_thumbprint(),
             &policy::sata_thumbprint(),
             None,
@@ -184,7 +190,7 @@ fn init_and_finalize(
         },
     ];
     let result = session
-        .part_final_ex(policy, &certs, prev_local_mk)
+        .part_final_ex(part_policy, &certs, prev_local_mk)
         .map_err(|e| Error::hsm("part_final_ex", format!("{e:?}")))?;
     Ok(result.local_mk_backup)
 }

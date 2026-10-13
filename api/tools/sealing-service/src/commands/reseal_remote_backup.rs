@@ -17,6 +17,8 @@
 //! without ever installing it locally. The destination becomes a member only
 //! after it runs `restore_remote_backup` against this reseal output.
 
+use azihsm_ddi_tbor_types::PartPolicy;
+
 use crate::cli::ResealRemoteBackupArgs;
 use crate::crypto::certs;
 use crate::error::Error;
@@ -202,6 +204,10 @@ pub fn run(ws: &Workspace, args: &ResealRemoteBackupArgs) -> Result<()> {
     // Open the operating session (emu reconstructs; hw opens directly).
     let operating = reconstruct::open(ws, &reseal_manifest)?;
 
+    // The SDK now takes a typed `&PartPolicy` view first; no cert chain here.
+    let part_policy = PartPolicy::ref_from_wire(&policy_bytes)
+        .ok_or_else(|| Error::Internal("reseal policy is not a valid PartPolicy".to_owned()))?;
+
     // One-shot HSM operation: HPKE-open the inbound hand-off (authenticated by
     // the source evidence) and HPKE-Auth-seal the recovered BKS3 to the
     // destination. Both evidence bundles are borrowed simultaneously by nesting
@@ -211,10 +217,10 @@ pub fn run(ws: &Workspace, args: &ResealRemoteBackupArgs) -> Result<()> {
         .with_hsm_evidence(|src_ev| {
             dest_bundle.with_hsm_evidence(|dest_ev| {
                 operating.session.sd_reseal_remote_backup(
+                    part_policy,
                     &masked,
                     src_ev,
                     dest_ev,
-                    &policy_bytes,
                     &src_remote_backup,
                 )
             })

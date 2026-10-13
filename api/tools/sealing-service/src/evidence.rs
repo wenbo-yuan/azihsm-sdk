@@ -10,17 +10,25 @@
 //! the CLI's own on-disk container so evidence `key_report` generates for one
 //! partition can be supplied to a secure-domain operation on another.
 //!
-//! The bundle holds only public attestation material — three certificate chains
+//! The bundle holds only public attestation material — four certificate chains
 //! (each an ordered root → leaf DER list) and the COSE_Sign1 key report. It
 //! never contains a sealing private key or any masking key.
 //!
+//! Three of the chains (manufacturer, owner, partition-owner) are the partition
+//! identity evidence: each leaf certifies the report-signing PID public key.
+//! The fourth — the sealing-key chain (spec `RcvrCertChain` / `SndrCertChain`)
+//! — is anchored to the policy SATA key and its leaf certifies the sealing
+//! key's own public key (`RcvrPub`), the key a remote backup is sealed to. The
+//! firmware recovers that public key from this chain; the identity evidence is
+//! verified only when the policy sets `require_trusted_sa_key`.
+//!
 //! # Container format
 //!
-//! A little-endian, length-prefixed binary layout (version 1):
+//! A little-endian, length-prefixed binary layout (version 2):
 //!
 //! ```text
-//! magic    : 8 bytes  = b"AZSDEV01"   (format tag + version)
-//! for each of [manufacturer, owner, partition-owner] chain, in order:
+//! magic    : 8 bytes  = b"AZSDEV02"   (format tag + version)
+//! for each of [manufacturer, owner, partition-owner, sealing-key] chain, in order:
 //!   count  : u16      number of certificates in the chain
 //!   for each certificate:
 //!     len  : u32      certificate DER length
@@ -35,29 +43,36 @@ use azihsm_api::HsmSdEvidence;
 use crate::error::Error;
 use crate::error::Result;
 
-const MAGIC: [u8; 8] = *b"AZSDEV01";
+const MAGIC: [u8; 8] = *b"AZSDEV02";
 
-/// An owned secure-domain evidence bundle: three DER certificate chains (each
-/// an ordered root → leaf list) and the COSE_Sign1 key report.
+/// An owned secure-domain evidence bundle: four DER certificate chains (each an
+/// ordered root → leaf list) and the COSE_Sign1 key report. The first three
+/// chains are the partition-identity evidence (leaves certify the PID key); the
+/// fourth is the sealing-key chain (spec `RcvrCertChain` / `SndrCertChain`),
+/// anchored to the policy SATA key with a leaf certifying the sealing key's own
+/// public key (`RcvrPub`).
 pub struct EvidenceBundle {
     manufacturer_chain: Vec<Vec<u8>>,
     owner_chain: Vec<Vec<u8>>,
     partition_owner_chain: Vec<Vec<u8>>,
+    sealing_key_chain: Vec<Vec<u8>>,
     report: Vec<u8>,
 }
 
 impl EvidenceBundle {
-    /// Assemble a bundle from its three chains and the key report.
+    /// Assemble a bundle from its four chains and the key report.
     pub fn new(
         manufacturer_chain: Vec<Vec<u8>>,
         owner_chain: Vec<Vec<u8>>,
         partition_owner_chain: Vec<Vec<u8>>,
+        sealing_key_chain: Vec<Vec<u8>>,
         report: Vec<u8>,
     ) -> Self {
         Self {
             manufacturer_chain,
             owner_chain,
             partition_owner_chain,
+            sealing_key_chain,
             report,
         }
     }
@@ -94,6 +109,7 @@ impl EvidenceBundle {
             &self.manufacturer_chain,
             &self.owner_chain,
             &self.partition_owner_chain,
+            &self.sealing_key_chain,
         ] {
             out.extend_from_slice(&(chain.len() as u16).to_le_bytes());
             for cert in chain {
@@ -116,6 +132,7 @@ impl EvidenceBundle {
         let manufacturer_chain = r.chain()?;
         let owner_chain = r.chain()?;
         let partition_owner_chain = r.chain()?;
+        let sealing_key_chain = r.chain()?;
         let report_len = r.u32()? as usize;
         let report = r.take(report_len)?.to_vec();
         if !r.is_empty() {
@@ -125,6 +142,7 @@ impl EvidenceBundle {
             manufacturer_chain,
             owner_chain,
             partition_owner_chain,
+            sealing_key_chain,
             report,
         })
     }
@@ -142,6 +160,50 @@ impl EvidenceBundle {
             part_owner_cert_chain: &part_owner,
             report: &self.report,
         })
+    }
+
+    /// Build the sealing-key certificate chain (spec `RcvrCertChain`) together
+    /// with the borrowed [`HsmSdEvidence`] and pass both to `f` — the exact
+    /// argument shape [`sd_create_remote_backup`](azihsm_api::HsmSession::sd_create_remote_backup)
+    /// takes. The borrowed arrays live only for the call, so they are delivered
+    /// through a closure.
+    pub fn with_create_backup<R>(
+        &self,
+        f: impl FnOnce(&[HsmCert<'_>], &HsmSdEvidence<'_>) -> R,
+    ) -> R {
+        self.with_sealing_key_evidence(f)
+    }
+
+    /// As [`with_create_backup`](Self::with_create_backup), but named for the
+    /// restore side where the chain is the sender's (spec `SndrCertChain`) —
+    /// the argument shape [`sd_restore_remote_backup`](azihsm_api::HsmSession::sd_restore_remote_backup)
+    /// takes.
+    pub fn with_restore_backup<R>(
+        &self,
+        f: impl FnOnce(&[HsmCert<'_>], &HsmSdEvidence<'_>) -> R,
+    ) -> R {
+        self.with_sealing_key_evidence(f)
+    }
+
+    /// Shared implementation surfacing the SATA-anchored sealing-key chain and
+    /// the three-chain identity evidence together to `f`.
+    fn with_sealing_key_evidence<R>(
+        &self,
+        f: impl FnOnce(&[HsmCert<'_>], &HsmSdEvidence<'_>) -> R,
+    ) -> R {
+        let mfgr = to_certs(&self.manufacturer_chain);
+        let owner = to_certs(&self.owner_chain);
+        let part_owner = to_certs(&self.partition_owner_chain);
+        let sealing = to_certs(&self.sealing_key_chain);
+        f(
+            &sealing,
+            &HsmSdEvidence {
+                mfgr_cert_chain: &mfgr,
+                owner_cert_chain: &owner,
+                part_owner_cert_chain: &part_owner,
+                report: &self.report,
+            },
+        )
     }
 }
 
@@ -214,6 +276,7 @@ mod tests {
             vec![vec![1, 2, 3], vec![4, 5]],
             vec![vec![6], vec![7, 8, 9, 10]],
             vec![vec![11, 12], vec![13]],
+            vec![vec![14, 15], vec![16, 17, 18]],
             vec![0xAA; 200],
         );
         let encoded = bundle.encode();
@@ -221,26 +284,28 @@ mod tests {
         assert_eq!(decoded.manufacturer_chain, bundle.manufacturer_chain);
         assert_eq!(decoded.owner_chain, bundle.owner_chain);
         assert_eq!(decoded.partition_owner_chain, bundle.partition_owner_chain);
+        assert_eq!(decoded.sealing_key_chain, bundle.sealing_key_chain);
         assert_eq!(decoded.report, bundle.report);
     }
 
     #[test]
     fn rejects_bad_magic() {
-        let mut encoded = EvidenceBundle::new(vec![], vec![], vec![], vec![]).encode();
+        let mut encoded = EvidenceBundle::new(vec![], vec![], vec![], vec![], vec![]).encode();
         encoded[0] ^= 0xFF;
         assert!(EvidenceBundle::decode(&encoded).is_err());
     }
 
     #[test]
     fn rejects_trailing_bytes() {
-        let mut encoded = EvidenceBundle::new(vec![], vec![], vec![], vec![1]).encode();
+        let mut encoded = EvidenceBundle::new(vec![], vec![], vec![], vec![], vec![1]).encode();
         encoded.push(0);
         assert!(EvidenceBundle::decode(&encoded).is_err());
     }
 
     #[test]
     fn rejects_truncated() {
-        let encoded = EvidenceBundle::new(vec![vec![1, 2, 3]], vec![], vec![], vec![]).encode();
+        let encoded =
+            EvidenceBundle::new(vec![vec![1, 2, 3]], vec![], vec![], vec![], vec![]).encode();
         assert!(EvidenceBundle::decode(&encoded[..encoded.len() - 2]).is_err());
     }
 }

@@ -13,6 +13,8 @@
 //! runs `restore_peer_backup`. Gated by the domain's `allow_peer_cloning`
 //! policy flag, which the firmware enforces.
 
+use azihsm_ddi_tbor_types::PartPolicy;
+
 use crate::cli::CreatePeerBackupArgs;
 use crate::crypto::certs;
 use crate::error::Error;
@@ -167,18 +169,19 @@ pub fn run(ws: &Workspace, args: &CreatePeerBackupArgs) -> Result<()> {
     // Open the operating session (emu reconstructs; hw opens directly).
     let session = reconstruct::open(ws, &operating_manifest)?;
 
+    // The SDK now takes a typed `&PartPolicy` view first; no cert chain here.
+    let part_policy = PartPolicy::ref_from_wire(&policy_bytes)
+        .ok_or_else(|| Error::Internal("operating policy is not a valid PartPolicy".to_owned()))?;
+
     // One-shot HSM operation: recover the BKS3 from the operating partition's
     // device-local backup and HPKE-Auth-seal it to the peer. The firmware
     // performs the authoritative evidence, SATA-anchor, report-signature,
     // policy-binding and `allow_peer_cloning` checks.
     let peer_backup = peer_bundle
         .with_hsm_evidence(|peer_ev| {
-            session.session.sd_create_peer_backup(
-                &masked,
-                peer_ev,
-                &policy_bytes,
-                &pok_local_backup,
-            )
+            session
+                .session
+                .sd_create_peer_backup(part_policy, &masked, peer_ev, &pok_local_backup)
         })
         .map_err(|e| Error::hsm("sd_create_peer_backup", format!("{e:?}")))?;
 
