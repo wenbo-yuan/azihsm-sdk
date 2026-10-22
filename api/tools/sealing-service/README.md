@@ -21,6 +21,8 @@ The full design contract lives in
 this README is the operator's quick reference plus a walkthrough of the
 end-to-end test flows.
 
+For copy-paste demo workflows, see the [Demo Cheatsheet](DEMO-CHEATSHEET.md).
+
 ## Flavors
 
 One binary, two compile-time flavors selected by a Cargo feature:
